@@ -70,6 +70,32 @@ candidate column is rank-deficient. With the default `pivot_factor` (`1e-6`
 internally), this happens only when the natural-ordered column has
 essentially zero residual norm.
 
+### Adaptive dense fallback (opt-in)
+
+For matrices where the active submatrix loses its sparsity midway through
+factorization, the numeric kernel can switch to LAPACK `geqp3!` on the
+trailing dense block. Enable with `adaptive_dense=true` and tune via
+`dense_threshold` (default `0.4` of the active row count):
+
+```julia
+F = csr_qr(Acsr; ordering=:amd, adaptive_dense=true, dense_threshold=0.4)
+F = csr_refactor!(F, A2; adaptive_dense=true)
+```
+
+The trigger fires only after four consecutive Householder columns exceed
+`dense_threshold * (m2 - k + 1)`, guarding against isolated density
+spikes. Stored Householders for the dense tail live in `F.D` / `F.dtau`
+(compact LAPACK form); the composed column permutation lives in
+`F.q_eff`. Rank-revealing is preserved: dense `R` diagonals are checked
+against the same `tol` as the sparse phase.
+
+This is most useful on dense-fill matrices large enough for the
+column-pivoted dense QR's BLAS-3 inner kernels to amortise the
+materialisation step. On the bundled 199×199 user matrices the sparse
+AMD path is already faster (the etree keeps individual V columns sparse,
+so geqp3's overhead isn't recouped); on a synthetic 400×400 dense matrix
+the dense fallback is ~2× faster than the pure-sparse path.
+
 ## Algorithm
 
 Davis-style sparse QR (CSparse Algorithm 5.5), with one extension for
