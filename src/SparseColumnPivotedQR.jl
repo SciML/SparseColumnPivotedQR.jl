@@ -104,6 +104,24 @@ struct CSRQRFactorization{T, RT}
     rnk::Int
     tol::RT
     sym::CSRQRSymbolic
+    # Adaptive dense fallback. When the active submatrix becomes dense enough
+    # mid-factorization we switch to LAPACK geqp3 on the trailing block. The
+    # fields below describe that block; they are zero-length / `k_dense == 0`
+    # when no transition occurred.
+    #
+    # `k_dense`     : sparse Householders are V[:, 1..k_dense]; dense tail
+    #                 covers columns k_dense+1..n.
+    # `D`           : (m2 - k_dense) x (n - k_dense) compact LAPACK form from
+    #                 geqp3 — strict lower triangle = Householder vectors v,
+    #                 upper triangle = R (also redundantly emitted into CSC R).
+    # `dtau`        : Householder coefficients τ for the dense tail.
+    # `q_eff`       : composed column permutation (length n). Equals sym.q
+    #                 when k_dense == 0; otherwise equals
+    #                 [sym.q[1..k_dense]; sym.q[k_dense .+ jpvt_dense]].
+    k_dense::Int
+    D::Matrix{T}
+    dtau::Vector{T}
+    q_eff::Vector{Int}
 end
 
 LinearAlgebra.rank(F::CSRQRFactorization) = F.rnk
@@ -976,7 +994,8 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
     return CSRQRFactorization{T, RT}(sym.m, sym.n,
         Vp, Vi, Vx,
         Rp, Ri, Rx,
-        beta, rnk, tol_use, sym)
+        beta, rnk, tol_use, sym,
+        0, Matrix{T}(undef, 0, 0), T[], copy(sym.q))
 end
 
 # ---------------------------------------------------------------------------
