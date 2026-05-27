@@ -837,9 +837,15 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
     # When we decide to switch, we break out of the sparse loop with
     # `k_sparse > 0` and run the dense fallback below.
     k_sparse_done = 0    # number of sparse columns successfully completed
-    # Minimum remaining work to justify the dense overhead. Below this we
-    # just finish sparse.
+    consec_dense = 0     # consecutive columns whose V has crossed threshold
+    # Minimum number of remaining columns to justify the dense overhead.
+    # Below this we just finish sparse — at small block sizes geqp3 setup
+    # cost dwarfs any saving.
     dense_min_remaining = 16
+    # Require at least this many consecutive dense V columns before we
+    # actually switch. This guards against isolated density spikes in an
+    # otherwise-sparse matrix.
+    dense_consec_required = 4
 
     @inbounds for k in 1:n
         # --- 1) ereach pattern of R[:,k] + scatter S[:,k] into x ---------
@@ -1017,14 +1023,25 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
         end
 
         # --- Adaptive dense fallback trigger -----------------------------
-        # If V[:,k] is dense relative to the (m2 - k + 1) active rows AND
-        # there are enough remaining columns to justify the dense overhead,
-        # switch to dense LAPACK geqp3! on the trailing block.
-        if adaptive_dense && k < n && (n - k) >= dense_min_remaining
+        # If the just-emitted V[:,k] is dense relative to the (m2 - k + 1)
+        # active rows AND we've had `dense_consec_required` consecutive
+        # dense columns AND there are enough remaining columns to justify
+        # the dense overhead, break and finish in dense.
+        #
+        # The consecutive-dense guard stops the fallback from firing on
+        # AMD-ordered inputs where the etree keeps individual V columns
+        # sparse on average even when one isolated column is dense.
+        if adaptive_dense && k < n
             active_rows = m2 - k
             if active_rows > 0
                 density = vlen / RT(m2 - k + 1)
                 if density > dense_threshold
+                    consec_dense += 1
+                else
+                    consec_dense = 0
+                end
+                if (n - k) >= dense_min_remaining &&
+                   consec_dense >= dense_consec_required
                     k_sparse_done = k
                     break
                 end
