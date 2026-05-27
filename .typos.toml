@@ -1,0 +1,28 @@
+[default.extend-words]
+# Julia-specific functions
+indexin = "indexin"
+findfirst = "findfirst"
+findlast = "findlast"
+eachindex = "eachindex"
+
+# Mathematical / numerical-linear-algebra terms that look like typos
+ata = "ata"             # A^T A
+etree = "etree"         # elimination tree
+ereach = "ereach"       # row-reach in elimination tree
+ldiv = "ldiv"
+norm2 = "norm2"
+hh = "hh"
+postord = "postord"
+postorder = "postorder"
+
+# Author / library names
+Davis = "Davis"
+Gilbert = "Gilbert"
+Peyton = "Peyton"
+Bujanovic = "Bujanovic"
+Drmac = "Drmac"
+KLU = "KLU"
+SPQR = "SPQR"
+CXSparse = "CXSparse"
+COLAMD = "COLAMD"
+AMD = "AMD"
