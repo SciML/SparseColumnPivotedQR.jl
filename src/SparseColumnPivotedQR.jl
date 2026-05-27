@@ -782,9 +782,8 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
     # Workspaces.
     x = zeros(T, m2)
     s = zeros(Int, n)
-    w = zeros(Int, n)       # ereach marker by column (mark = k each step)
-    rowmark = zeros(Int, m2)  # V-pattern marker by row (mark = k each step)
-    vrows = zeros(Int, m2)
+    w = zeros(Int, n)        # ereach marker by column (mark = k each step)
+    vrows = zeros(Int, m2)   # V[:,k]'s row list, built at emit time
 
     V.colptr[1] = 1
     R.colptr[1] = 1
@@ -796,15 +795,9 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
         # --- 1) ereach pattern of R[:,k] + scatter S[:,k] into x ---------
         top = n + 1
         c1 = colptr[k]; c2 = colptr[k + 1] - 1
-        vlen = 0
         for p in c1:c2
             i = rowval[p]
             x[i] = nzval[p]
-            if rowmark[i] != k
-                rowmark[i] = k
-                vlen += 1
-                vrows[vlen] = i
-            end
             lm = leftmost[i]
             if lm > 0 && lm <= k
                 len = 0
@@ -831,6 +824,11 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
         # Pattern in s[top..n] is in increasing column index. Iterate that
         # order: apply H_1, H_2, ..., H_{k-1} (the original order of the
         # outer QR loop).
+        #
+        # We deliberately do NOT track V[:,k]'s row pattern here. Instead we
+        # scan x[k..m2] for nonzeros at the end of the apply phase. This
+        # keeps the apply inner loop branch-free (the tau dot-product and
+        # AXPY both vectorize well).
         for spos in top:n
             p_idx = s[spos]
             if p_idx == k
@@ -838,20 +836,13 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
             end
             vc1 = V.colptr[p_idx]; vc2 = V.colptr[p_idx + 1] - 1
             bk = beta[p_idx]
-            # Combined pass: compute tau and mark new rows in vrows pattern.
             tau = zero(T)
-            for vp in vc1:vc2
-                ri = V.rowval[vp]
-                if rowmark[ri] != k
-                    rowmark[ri] = k
-                    vlen += 1
-                    vrows[vlen] = ri
-                end
-                tau += conj(V.nzval[vp]) * x[ri]
+            @simd for vp in vc1:vc2
+                tau += conj(V.nzval[vp]) * x[V.rowval[vp]]
             end
             if bk != 0 && tau != 0
                 tau_b = T(bk) * tau
-                for vp in vc1:vc2
+                @simd for vp in vc1:vc2
                     x[V.rowval[vp]] -= tau_b * V.nzval[vp]
                 end
             end
@@ -865,36 +856,18 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
             x[p_idx] = zero(T)
         end
 
-        # Ensure row k is in vrows.
-        if rowmark[k] != k
-            rowmark[k] = k
-            vlen += 1
-            vrows[vlen] = k
-        end
-
-        # Move row k to slot 1 and drop any vrows[i] < k.
-        # First find k's current position and swap to slot 1.
-        if vrows[1] != k
-            kpos = 0
-            for q in 1:vlen
-                if vrows[q] == k
-                    kpos = q; break
-                end
-            end
-            if kpos > 1
-                vrows[kpos] = vrows[1]; vrows[1] = k
+        # --- 2b) Build V[:,k]'s row list by scanning x[k..m2] for nonzeros.
+        # The row indices are written into vrows[1..vlen], with vrows[1] = k
+        # (the diagonal row) and the remaining entries being rows > k with
+        # x[i] != 0.
+        vrows[1] = k
+        vlen = 1
+        for i in (k + 1):m2
+            if x[i] != zero(T)
+                vlen += 1
+                vrows[vlen] = i
             end
         end
-        # Compact: keep vrows[1] = k, keep vrows[i] > k for i >= 2.
-        w2 = 1
-        for q in 2:vlen
-            ri = vrows[q]
-            if ri > k
-                w2 += 1
-                vrows[w2] = ri
-            end
-        end
-        vlen = w2
 
         # --- 3) Build Householder for x[vrows[1..vlen]] -----------------
         # Compute alpha, beta_k. v[1] = x[vrows[1]] - alpha; v[j>=2] unchanged.
