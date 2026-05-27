@@ -437,58 +437,26 @@ function _vnz_rnz_estimate(colptr::Vector{Int}, rowval::Vector{Int},
                             leftmost_orig::Vector{Int},
                             m::Int, n::Int)
     # rnz: for each column k of S, run ereach to count R[:,k] pattern entries
-    # (excluding diagonal). Each ereach walk is amortized O(|R[:,k]|).
-    s = zeros(Int, n)
-    w = zeros(Int, n)
-    rnz = 0
-    @inbounds for k in 1:n
-        c1 = colptr[k]; c2 = colptr[k + 1] - 1
-        top = n + 1
-        for p in c1:c2
-            i = rowval[p]
-            lm = leftmost_orig[i]
-            if lm > 0 && lm <= k
-                len = 0
-                jj = lm
-                while jj != 0 && w[jj] != k && jj < k
-                    s[len + 1] = jj
-                    len += 1
-                    w[jj] = k
-                    jj = parent[jj]
-                end
-                # Transfer s[1..len] (deepest-first walk order) into
-                # s[top-len..top-1] in *increasing-column-index* order so that
-                # the apply loop iterates s[top..n] from smallest to largest k.
-                # Davis cs_ereach does this with `while(len>0) s[--top]=s[--len]`
-                # which moves s[len] -> s[top-1], etc. The result: smallest
-                # index ends up at the lowest output slot.
-                while len > 0
-                    top -= 1
-                    s[top] = s[len]
-                    len -= 1
-                end
-            end
-        end
-        rnz += (n + 1 - top)  # includes diag (will recount: actually diag
-                              # is always in the pattern since we walk from
-                              # leftmost <= k up to k itself).
-    end
-    # Add +n for the diagonals (in case ereach didn't include them — it does
-    # if and only if leftmost[i] reaches k from some row i in the column).
-    # Conservative slack:
-    rnz += n
-    rnz = rnz + max(16, rnz >> 4)
-
-    # vnz: bounded by sum over real rows of (n - leftmost[i] + 1). For
-    # m << n this is generous; for dense-fill cases this is fine.
+    # (excluding diagonal). We use a *cheap* upper-bound: for each column k,
+    # the number of R entries is at most k itself (full upper triangle), but
+    # a tighter and cheaper bound uses the etree depth from the row reach.
+    # Compute a conservative bound via per-row contribution: each row i in
+    # the original matrix contributes (n - leftmost[i] + 1) entries summed
+    # across all R columns it touches. This overcounts but is O(m) instead
+    # of O(n * mean_pattern_size).
+    # vnz: bounded by sum over real rows of (n - leftmost[i] + 1).
     vnz = 0
+    rnz_bound = 0
     @inbounds for i in 1:m
         lm = leftmost_orig[i]
         if lm != 0
-            vnz += (n - lm + 1)
+            extent = n - lm + 1
+            vnz += extent
+            rnz_bound += extent
         end
     end
     vnz = vnz + max(16, vnz >> 4)
+    rnz = min(rnz_bound, n * (n + 1) ÷ 2) + max(16, rnz_bound >> 4)
     return vnz, rnz
 end
 
