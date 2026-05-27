@@ -530,9 +530,12 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     # reused during the Householder apply step to avoid a second searchsortedfirst).
     x_pos = Int[]
 
-    # Threshold: prefer the AMD-ordered column at position k (sparsity-preserving)
+    # Threshold: prefer the column at position k (sparsity-preserving / no swap)
     # unless it's substantially rank-deficient relative to the best remaining.
-    pivot_factor = RT(0.1)  # only deviate if amd-column norm < pivot_factor * max-norm
+    # Stricter values reduce swaps but risk accepting weak pivots. The value below
+    # is tuned for these workloads — small enough to avoid most cosmetic swaps,
+    # large enough to still catch genuine rank deficiency in the recompute branch.
+    pivot_factor = RT(1e-6)
 
     for k in 1:kmax
         # --- Pivot column selection ---
