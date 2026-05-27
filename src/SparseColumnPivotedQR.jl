@@ -514,9 +514,10 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     kmax = min(m, n)
     rnk = kmax
 
-    # Reusable workspaces.
+    # Reusable workspaces. Vector{Bool} is preferred over BitVector for w_touched
+    # since the inner gather is bit-indexing-heavy.
     w = zeros(T, n)
-    w_touched = falses(n)
+    w_touched = fill(false, n)
     mark_cols = Int[]
     sizehint!(mark_cols, n)
     new_cols_buf = Int[]
