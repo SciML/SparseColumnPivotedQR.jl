@@ -8,6 +8,7 @@ import LinearAlgebra: ldiv!, rank
 import Base: \, size, eltype
 
 export csr_qr, csr_analyze, csr_factor, csr_refactor!,
+       has_amd_extension,
        CSRQRSymbolic, CSRQRFactorization
 
 # CSR offset: rowptr stores 1-based if Bi == 1, 0-based if Bi == 0.
@@ -299,6 +300,31 @@ end
 # Default no-op AMD hook; overridden by the AMD.jl extension.
 _amd_colperm(rowptr, colval, m, n) = collect(1:n)
 
+# Set to `true` by the AMD.jl extension on `__init__`. Lets `csr_analyze` /
+# `csr_qr` resolve the default ordering (`:default`) to `:amd` only when the
+# extension is actually loaded, falling back to `:natural` otherwise. Using a
+# Ref so it can be flipped from the extension at load time.
+const _AMD_EXT_LOADED = Ref(false)
+
+"""
+    has_amd_extension() -> Bool
+
+Returns `true` iff the `AMD.jl` extension has been loaded into the current
+session (i.e. `using AMD` has been executed). The default ordering
+`:default` resolves to `:amd` only when this is `true`, falling back to
+`:natural` otherwise.
+"""
+has_amd_extension() = _AMD_EXT_LOADED[]
+
+# Resolve `:default` to `:amd` when the AMD extension is loaded, `:natural`
+# otherwise. All other symbols pass through.
+@inline function _resolve_ordering(ordering::Symbol)
+    if ordering === :default
+        return _AMD_EXT_LOADED[] ? :amd : :natural
+    end
+    return ordering
+end
+
 function _build_symbolic(rowptr::Vector{Int}, colval::Vector{Int},
                           m::Int, n::Int, ordering::Symbol)
     # 1) Column permutation `q`.
@@ -465,7 +491,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    csr_analyze(A::SparseMatrixCSR; ordering=:natural) -> CSRQRSymbolic
+    csr_analyze(A::SparseMatrixCSR; ordering=:default) -> CSRQRSymbolic
 
 Symbolic analysis phase for the sparse column-pivoted Householder QR
 factorization. Computes the column permutation `q`, row permutation `pinv`,
@@ -473,20 +499,31 @@ column elimination tree, per-row `leftmost`, and the upper-bound sizes of
 the V (Householder) and R buffers.
 
 `ordering` selects the column ordering:
-  * `:natural` — identity ordering (default; best on dense-fill matrices).
-  * `:amd`     — AMD on AᵀA (requires `using AMD` to enable the extension).
+  * `:default` — `:amd` if the AMD.jl extension is loaded (`using AMD`),
+                 `:natural` otherwise. **This is the default.**
+  * `:natural` — identity ordering (opt-in; usually slower than `:amd` on
+                 dense-fill matrices because the column etree degenerates
+                 to a chain).
+  * `:amd`     — AMD on AᵀA (requires `using AMD` to enable the extension;
+                 throws an `ArgumentError` otherwise).
   * `:colamd`  — alias for `:amd`.
 
 Returns a `CSRQRSymbolic` that can be passed to `csr_factor` and reused via
 `csr_refactor!` for matrices with identical sparsity patterns.
 """
-function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:natural) where {Bi}
+function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:default) where {Bi}
     m, n = size(A)
     rowptr, colval = _capture_pattern(A)
+    ordering_use = _resolve_ordering(ordering)
+    if (ordering_use === :amd || ordering_use === :colamd) && !_AMD_EXT_LOADED[]
+        throw(ArgumentError(
+            "ordering=:amd requires the AMD.jl extension; load it via `using AMD`"
+        ))
+    end
     q, pinv, parent, leftmost_perm, m2, vnz, rnz =
-        _build_symbolic(rowptr, colval, m, n, ordering)
+        _build_symbolic(rowptr, colval, m, n, ordering_use)
     return CSRQRSymbolic(m, n, m2, q, pinv, parent, leftmost_perm,
-                          vnz, rnz, ordering, rowptr, colval)
+                          vnz, rnz, ordering_use, rowptr, colval)
 end
 
 """
@@ -508,13 +545,19 @@ function csr_factor(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
 end
 
 """
-    csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:natural) -> CSRQRFactorization
+    csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:default) -> CSRQRFactorization
 
 One-shot convenience: equivalent to `csr_factor(A, csr_analyze(A; ordering); tol)`.
+
+When `ordering=:default` (the default), the column ordering is `:amd` if the
+AMD.jl extension is loaded (`using AMD`) and `:natural` otherwise. On the
+typical dense-fill matrices that arise from nonlinear solver linsolves,
+`:amd` roughly halves the factor time. Pass `ordering=:natural` to opt out
+for matrices whose columns are already well-ordered.
 """
 function csr_qr(A::SparseMatrixCSR{Bi, T};
                 tol::Union{Nothing, Real}=nothing,
-                ordering::Symbol=:natural) where {Bi, T}
+                ordering::Symbol=:default) where {Bi, T}
     sym = csr_analyze(A; ordering=ordering)
     return csr_factor(A, sym; tol=tol)
 end

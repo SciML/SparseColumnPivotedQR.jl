@@ -239,6 +239,70 @@ end
         @test norm(A3 * x3 - b) / norm(b) < 1e-10
     end
 
+    @testset "default ordering resolves to :amd when AMD is loaded" begin
+        # AMD is `using`'d at the top of this file, so the extension is loaded.
+        @test SparseColumnPivotedQR.has_amd_extension()
+
+        Random.seed!(21)
+        n = 25
+        A = sprand(Float64, n, n, 0.25) + 3 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+
+        sym_default = csr_analyze(Acsr)            # implicit :default
+        sym_amd = csr_analyze(Acsr; ordering = :amd)
+        @test sym_default.ordering === :amd
+        @test sym_default.q == sym_amd.q
+
+        F_default = csr_qr(Acsr)
+        F_amd = csr_qr(Acsr; ordering = :amd)
+        x_default = F_default \ b
+        x_amd = F_amd \ b
+        @test x_default ≈ x_amd atol = 1.0e-12
+        @test rank(F_default) == n
+    end
+
+    @testset ":natural opt-in still works" begin
+        Random.seed!(22)
+        n = 15
+        A = sprand(Float64, n, n, 0.3) + 2 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+        sym_nat = csr_analyze(Acsr; ordering = :natural)
+        @test sym_nat.ordering === :natural
+        @test sym_nat.q == collect(1:n)
+        F = csr_qr(Acsr; ordering = :natural)
+        @test rank(F) == n
+        @test norm(A * (F \ b) - b) / norm(b) < 1.0e-10
+    end
+
+    @testset "default ordering on bundled 199x199 matrices" begin
+        # Sanity: default ordering on the user matrices == :amd (since AMD is
+        # loaded here) and the resulting factor has strictly fewer nnz(R)
+        # than the natural-ordered factor on these dense-fill matrices.
+        dir = joinpath(@__DIR__, "matrices")
+        files = sort(
+            filter(f -> endswith(f, ".txt"), readdir(dir; join = true))
+        )
+        @test !isempty(files)
+        for f in files
+            text = read(f, String)
+            lines = split(text, '\n'; keepempty = false)
+            A = eval(Meta.parse(strip(lines[1])))
+            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            sym_default = csr_analyze(Acsr)
+            sym_amd = csr_analyze(Acsr; ordering = :amd)
+            # :default == :amd here.
+            @test sym_default.q == sym_amd.q
+
+            # Actual nnz(R) should be lower with AMD than natural on these
+            # dense-fill matrices.
+            F_nat = csr_qr(Acsr; ordering = :natural)
+            F_amd = csr_qr(Acsr; ordering = :amd)
+            @test length(F_amd.R_nzval) < length(F_nat.R_nzval)
+        end
+    end
+
     @testset "ordering propagated through csr_qr" begin
         Random.seed!(14)
         n = 20
