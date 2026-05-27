@@ -4,6 +4,7 @@ using SparseArrays
 using SparseMatricesCSR
 using Random
 using SparseColumnPivotedQR
+using AMD  # trigger AMD extension
 
 # helper: convert CSC -> CSR
 to_csr(A::SparseMatrixCSC) = SparseMatrixCSR(transpose(sparse(transpose(A))))
@@ -143,6 +144,110 @@ end
         @test rank(F) == n
         x = F \ b
         @test norm(Adense * x - b) / norm(b) < 1e-10
+    end
+
+    @testset "analyze + factor split" begin
+        Random.seed!(11)
+        n = 25
+        A = sprand(Float64, n, n, 0.25) + 3 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+
+        sym = csr_analyze(Acsr; ordering=:natural)
+        @test size(sym) == (n, n)
+        F = csr_factor(Acsr, sym)
+        x = F \ b
+        @test rank(F) == n
+        @test norm(A * x - b) / norm(b) < 1e-10
+
+        # csr_qr matches csr_factor(csr_analyze)
+        F2 = csr_qr(Acsr; ordering=:natural)
+        x2 = F2 \ b
+        @test rank(F2) == n
+        @test norm(x - x2) / max(norm(x), 1.0) < 1e-12
+    end
+
+    @testset "AMD ordering" begin
+        Random.seed!(12)
+        n = 40
+        A = sprand(Float64, n, n, 0.15) + 3 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+
+        sym_nat = csr_analyze(Acsr; ordering=:natural)
+        sym_amd = csr_analyze(Acsr; ordering=:amd)
+        sym_col = csr_analyze(Acsr; ordering=:colamd)
+
+        # AMD should produce a non-identity permutation on a random matrix
+        @test sym_amd.colperm != 1:n
+        # colamd ordering is currently aliased to amd
+        @test sym_col.colperm == sym_amd.colperm
+
+        F_nat = csr_factor(Acsr, sym_nat); x_nat = F_nat \ b
+        F_amd = csr_factor(Acsr, sym_amd); x_amd = F_amd \ b
+
+        @test rank(F_nat) == n
+        @test rank(F_amd) == n
+        @test norm(A * x_nat - b) / norm(b) < 1e-10
+        @test norm(A * x_amd - b) / norm(b) < 1e-10
+
+        # AMD should not blow up fill: total nnz(R) <= natural's by a reasonable factor
+        nnz_nat = sum(length, F_nat.R_cols)
+        nnz_amd = sum(length, F_amd.R_cols)
+        # No strict inequality (AMD can lose on some matrices), but shouldn't be wildly worse.
+        @test nnz_amd <= 4 * nnz_nat
+    end
+
+    @testset "csr_refactor!" begin
+        Random.seed!(13)
+        n = 30
+        # Build two matrices with identical pattern, different values.
+        Asp = sprand(Float64, n, n, 0.2)
+        rows, cols, _ = findnz(Asp)
+        v1 = randn(length(rows))
+        v2 = randn(length(rows))
+        A1 = sparse(rows, cols, v1, n, n) + 4 * sparse(I, n, n)
+        A2 = sparse(rows, cols, v2, n, n) + 4 * sparse(I, n, n)
+        Acsr1 = build_csr(Matrix(A1))
+        Acsr2 = build_csr(Matrix(A2))
+        b = randn(n)
+
+        F1 = csr_qr(Acsr1)
+        x1 = F1 \ b
+        @test norm(A1 * x1 - b) / norm(b) < 1e-10
+
+        # Refactor with same pattern, different values
+        F2 = csr_refactor!(F1, Acsr2)
+        x2 = F2 \ b
+        @test norm(A2 * x2 - b) / norm(b) < 1e-10
+
+        # Compare against fresh factor
+        F2_fresh = csr_qr(Acsr2)
+        x2_fresh = F2_fresh \ b
+        @test norm(x2 - x2_fresh) / max(norm(x2_fresh), 1.0) < 1e-10
+
+        # Refactor with a different pattern triggers full analyze+factor
+        A3 = sprand(Float64, n, n, 0.3) + 4 * sparse(I, n, n)
+        Acsr3 = build_csr(Matrix(A3))
+        F3 = csr_refactor!(F1, Acsr3)
+        x3 = F3 \ b
+        @test norm(A3 * x3 - b) / norm(b) < 1e-10
+    end
+
+    @testset "ordering propagated through csr_qr" begin
+        Random.seed!(14)
+        n = 20
+        A = sprand(Float64, n, n, 0.3) + 3 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+        F_nat = csr_qr(Acsr; ordering=:natural)
+        F_amd = csr_qr(Acsr; ordering=:amd)
+        # Same solution to LS tolerance
+        x_nat = F_nat \ b
+        x_amd = F_amd \ b
+        @test norm(A * x_nat - b) / norm(b) < 1e-10
+        @test norm(A * x_amd - b) / norm(b) < 1e-10
+        @test rank(F_nat) == rank(F_amd) == n
     end
 
 end
