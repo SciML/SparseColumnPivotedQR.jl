@@ -583,15 +583,12 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
 
     RT = real(T)
 
-    # Build CSC of A directly from the CSR.
-    colptr_A, rowval_A, nzval_A, _, _ = _csr_to_csc(A)
-
-    # Frobenius norm of A.
-    fro = zero(RT)
-    @inbounds for p in eachindex(nzval_A)
-        fro += abs2(nzval_A[p])
-    end
-    fro = sqrt(fro)
+    # Single-pass CSR -> CSC(A) conversion + Frobenius norm + column-norm
+    # cache (the column norms feed the zero-column check below). This fuses
+    # what used to be _csr_to_csc, a separate norm-loop, and the col-norm
+    # computation inside _maybe_repivot_zero_cols.
+    colptr_A, rowval_A, nzval_A, col_nrm2, fro2 = _csr_to_csc_with_norms(A)
+    fro = sqrt(fro2)
     tol_use = tol === nothing ? RT(eps(RT) * max(m, n)) * fro : RT(max(tol, 0))
     tol2 = tol_use * tol_use
 
@@ -600,15 +597,59 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     # produce the correct basic LS solution even when A has linearly dependent
     # columns. Without this, a zero column in the middle of R causes back-sub
     # to fail (the row constraint for that index cannot be satisfied by any
-    # later z). Cost: O(n + nnz) per factor call to compute norms + rebuild
-    # the affected symbolic data when zero columns are present.
-    sym_use = _maybe_repivot_zero_cols(A, colptr_A, rowval_A, nzval_A, sym, fro)
+    # later z).
+    sym_use = _maybe_repivot_zero_cols_from_norms(col_nrm2, sym, fro)
 
-    # Apply row+column permutation: S = (P A Q).
+    # Apply row+column permutation: S = (P A Q). Fused: walks colptr_A once,
+    # writes the permuted CSC in pinv- / q-permuted order.
     colptr_S, rowval_S, nzval_S =
         _permute_pq(colptr_A, rowval_A, nzval_A, sym_use.pinv, sym_use.q, m, n)
 
     return _csc_qr_numeric(colptr_S, rowval_S, nzval_S, sym_use, tol_use, tol2)
+end
+
+# CSR -> CSC of A, plus per-column squared norms and total ||A||_F^2. The
+# norms come for free as we already iterate every nonzero during the
+# conversion. Saves a redundant nzval scan in _factor_kernel.
+function _csr_to_csc_with_norms(A::SparseMatrixCSR{Bi, T}) where {Bi, T}
+    m, n = size(A)
+    off = getoffset(A)
+    rowptr = A.rowptr
+    colval = A.colval
+    nzval_in = A.nzval
+    nnz_total = length(colval)
+    RT = real(T)
+
+    colcounts = zeros(Int, n)
+    @inbounds for p in 1:nnz_total
+        colcounts[Int(colval[p]) + off] += 1
+    end
+    colptr = Vector{Int}(undef, n + 1)
+    colptr[1] = 1
+    @inbounds for j in 1:n
+        colptr[j + 1] = colptr[j] + colcounts[j]
+    end
+    rowval = Vector{Int}(undef, nnz_total)
+    nzval = Vector{T}(undef, nnz_total)
+    col_nrm2 = zeros(RT, n)
+    work = copy(colptr)
+    fro2 = zero(RT)
+    @inbounds for i in 1:m
+        r1 = rowptr[i] + off
+        r2 = rowptr[i + 1] + off - 1
+        for p in r1:r2
+            j = Int(colval[p]) + off
+            slot = work[j]
+            v = nzval_in[p]
+            rowval[slot] = i
+            nzval[slot] = v
+            work[j] = slot + 1
+            v2 = abs2(v)
+            col_nrm2[j] += v2
+            fro2 += v2
+        end
+    end
+    return colptr, rowval, nzval, col_nrm2, fro2
 end
 
 # Inspect column norms of A. If any are below `fro * eps(RT) * n` (i.e.,
@@ -616,24 +657,11 @@ end
 # the value-independent symbolic pieces (parent, leftmost, m2, pinv, vnz, rnz)
 # for the new ordering. Returns either the original `sym` (no zero columns)
 # or a freshly-built one.
-function _maybe_repivot_zero_cols(A::SparseMatrixCSR{Bi, T},
-                                   colptr::Vector{Int}, rowval::Vector{Int},
-                                   nzval::Vector{T}, sym::CSRQRSymbolic,
-                                   fro_A::Real) where {Bi, T}
+function _maybe_repivot_zero_cols_from_norms(col_norms::Vector{RT},
+                                              sym::CSRQRSymbolic,
+                                              fro_A::Real) where {RT}
     n = sym.n
-    RT = real(T)
     eps_zero = RT(fro_A) * RT(eps(RT)) * RT(max(sym.m, n))
-    # Column j of A in original indexing.
-    col_norms = zeros(RT, n)
-    @inbounds for j in 1:n
-        s = zero(RT)
-        for p in colptr[j]:(colptr[j + 1] - 1)
-            s += abs2(nzval[p])
-        end
-        col_norms[j] = s
-    end
-    # Threshold: a column is "zero" if its squared norm is at or below the
-    # tolerance. We use eps_zero² to match the standard tol formulation.
     thr2 = eps_zero * eps_zero
     has_zero = false
     @inbounds for j in 1:n
@@ -663,7 +691,6 @@ function _maybe_repivot_zero_cols(A::SparseMatrixCSR{Bi, T},
             pos += 1
         end
     end
-    # If no change, just return sym.
     if q_new == sym.q
         return sym
     end
