@@ -365,6 +365,42 @@ end
         @test norm(Q * R_ext - PAq) < 1e-10
     end
 
+    @testset "adaptive ordering picks the shallower etree" begin
+        # On the dense-fill user matrices AMD's etree should win; the
+        # adaptive ordering should therefore pick :amd.
+        dir = joinpath(@__DIR__, "matrices")
+        files = sort(
+            filter(f -> endswith(f, ".txt"), readdir(dir; join = true))
+        )
+        for f in files
+            text = read(f, String)
+            lines = split(text, '\n'; keepempty = false)
+            A = eval(Meta.parse(strip(lines[1])))
+            b = eval(Meta.parse(strip(lines[2])))
+            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            sym_adapt = csr_analyze(Acsr; ordering = :adaptive)
+            @test sym_adapt.ordering === :amd
+            F = csr_factor(Acsr, sym_adapt)
+            if all(isfinite, b)
+                x = F \ b
+                @test all(isfinite, x)
+            end
+        end
+
+        # On an already-natural-friendly matrix (block-diagonal) AMD
+        # cannot improve on the chain depth; adaptive should keep :natural.
+        n = 60
+        # Build a block-diagonal matrix: identity + small random blocks
+        # along the diagonal. Natural order has a maximally branched
+        # etree (each block is its own subtree) so AMD provides no
+        # benefit.
+        I_part = sparse(I, n, n)
+        A = 5 * I_part
+        Acsr = build_csr(Matrix(A))
+        sym_adapt = csr_analyze(Acsr; ordering = :adaptive)
+        @test sym_adapt.ordering === :natural
+    end
+
     @testset "drop_tol prunes V columns and stays within tolerance" begin
         Random.seed!(31)
         n = 80

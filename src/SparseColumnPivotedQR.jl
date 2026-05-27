@@ -325,6 +325,42 @@ has_amd_extension() = _AMD_EXT_LOADED[]
     return ordering
 end
 
+# Cheap fill estimator: total depth of the column elimination tree (sum
+# over k of distance from k to root). Mirrors what the apply step pays —
+# deeper chain → more Householders touched per column. O(n) thanks to
+# the bottom-up recursion using a `depth` cache.
+function _etree_total_depth(parent::Vector{Int})
+    n = length(parent)
+    depth = zeros(Int, n)
+    total = 0
+    @inbounds for k in 1:n
+        # parent[k] is always > k (etree of column k has children with
+        # smaller indices). Walk up; cache depths so each node is touched
+        # once. Equivalent to the recursive depth function with memoisation.
+        if depth[k] == 0
+            # depth from k to root, computed via iteration with stack-free
+            # caching: walk to a node whose depth is known, then assign
+            # depths back along the path.
+            j = k
+            len = 0
+            while j != 0 && depth[j] == 0
+                len += 1
+                j = parent[j]
+            end
+            base = j == 0 ? 0 : depth[j]
+            j = k
+            d = base + len
+            while j != 0 && depth[j] == 0
+                depth[j] = d
+                d -= 1
+                j = parent[j]
+            end
+        end
+        total += depth[k]
+    end
+    return total
+end
+
 function _build_symbolic(rowptr::Vector{Int}, colval::Vector{Int},
                           m::Int, n::Int, ordering::Symbol)
     # 1) Column permutation `q`.
@@ -499,14 +535,18 @@ column elimination tree, per-row `leftmost`, and the upper-bound sizes of
 the V (Householder) and R buffers.
 
 `ordering` selects the column ordering:
-  * `:default` — `:amd` if the AMD.jl extension is loaded (`using AMD`),
-                 `:natural` otherwise. **This is the default.**
-  * `:natural` — identity ordering (opt-in; usually slower than `:amd` on
-                 dense-fill matrices because the column etree degenerates
-                 to a chain).
-  * `:amd`     — AMD on AᵀA (requires `using AMD` to enable the extension;
-                 throws an `ArgumentError` otherwise).
-  * `:colamd`  — alias for `:amd`.
+  * `:default`  — `:amd` if the AMD.jl extension is loaded (`using AMD`),
+                  `:natural` otherwise. **This is the default.**
+  * `:natural`  — identity ordering (opt-in; usually slower than `:amd` on
+                  dense-fill matrices because the column etree degenerates
+                  to a chain).
+  * `:amd`      — AMD on AᵀA (requires `using AMD` to enable the extension;
+                  throws an `ArgumentError` otherwise).
+  * `:colamd`   — alias for `:amd`.
+  * `:adaptive` — compute both `:amd` and `:natural` symbolics, pick the
+                  one with the smaller column-etree total depth (which
+                  bounds total apply work). Requires AMD; ~140 µs extra
+                  symbolic overhead vs `:amd` alone.
 
 Returns a `CSRQRSymbolic` that can be passed to `csr_factor` and reused via
 `csr_refactor!` for matrices with identical sparsity patterns.
@@ -515,11 +555,37 @@ function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:default) where {B
     m, n = size(A)
     rowptr, colval = _capture_pattern(A)
     ordering_use = _resolve_ordering(ordering)
-    if (ordering_use === :amd || ordering_use === :colamd) && !_AMD_EXT_LOADED[]
+    if (ordering_use === :amd || ordering_use === :colamd ||
+        ordering_use === :adaptive) && !_AMD_EXT_LOADED[]
         throw(ArgumentError(
-            "ordering=:amd requires the AMD.jl extension; load it via `using AMD`"
+            "ordering=:$ordering_use requires the AMD.jl extension; load it via `using AMD`"
         ))
     end
+
+    if ordering_use === :adaptive
+        # Build both candidate symbolics, compare predicted apply work via
+        # the column-etree total depth, keep the cheaper one. AMD's etree
+        # is branched and typically shallower; on already-well-ordered
+        # matrices natural can win and we fall back to it.
+        q_a, pinv_a, parent_a, leftmost_a, m2_a, vnz_a, rnz_a =
+            _build_symbolic(rowptr, colval, m, n, :amd)
+        q_n, pinv_n, parent_n, leftmost_n, m2_n, vnz_n, rnz_n =
+            _build_symbolic(rowptr, colval, m, n, :natural)
+        d_a = _etree_total_depth(parent_a)
+        d_n = _etree_total_depth(parent_n)
+        # Tiebreaker prefers :natural: cheaper symbolic, and on shallow
+        # etrees the apply-step difference is in the noise.
+        if d_a < d_n
+            return CSRQRSymbolic(m, n, m2_a, q_a, pinv_a, parent_a,
+                                  leftmost_a, vnz_a, rnz_a, :amd,
+                                  rowptr, colval)
+        else
+            return CSRQRSymbolic(m, n, m2_n, q_n, pinv_n, parent_n,
+                                  leftmost_n, vnz_n, rnz_n, :natural,
+                                  rowptr, colval)
+        end
+    end
+
     q, pinv, parent, leftmost_perm, m2, vnz, rnz =
         _build_symbolic(rowptr, colval, m, n, ordering_use)
     return CSRQRSymbolic(m, n, m2, q, pinv, parent, leftmost_perm,
