@@ -296,6 +296,82 @@ end
         @test norm(Q * R_ext - PAq) < 1e-10
     end
 
+    @testset "Workspace pool: csr_refactor! is zero-alloc steady-state" begin
+        Random.seed!(21)
+        n = 30
+        Asp = sprand(Float64, n, n, 0.2)
+        rows, cols, _ = findnz(Asp)
+        v1 = randn(length(rows)); v2 = randn(length(rows))
+        A1 = sparse(rows, cols, v1, n, n) + 4 * sparse(I, n, n)
+        A2 = sparse(rows, cols, v2, n, n) + 4 * sparse(I, n, n)
+        Acsr1 = build_csr(Matrix(A1))
+        Acsr2 = build_csr(Matrix(A2))
+        b = randn(n)
+
+        F = csr_qr(Acsr1; ordering=:amd)
+        # Warm up.
+        csr_refactor!(F, Acsr2)
+        csr_refactor!(F, Acsr1)
+
+        # Steady-state: refactor with the cached workspace must allocate 0 bytes.
+        nbytes = @allocated csr_refactor!(F, Acsr2)
+        @test nbytes == 0
+        nbytes = @allocated csr_refactor!(F, Acsr1)
+        @test nbytes == 0
+
+        # Sanity check the solution.
+        x = F \ b
+        @test norm(A1 * x - b) / norm(b) < 1e-10
+    end
+
+    @testset "Workspace pool: csr_refactor! mutates F in place" begin
+        # The mutation-in-place semantic of csr_refactor! means the returned
+        # factorization is === to the input one and the input's V/R buffers
+        # have been updated.
+        Random.seed!(22)
+        n = 20
+        A1 = sprand(Float64, n, n, 0.25) + 3 * sparse(I, n, n)
+        A2 = sprand(Float64, n, n, 0.25) + 3 * sparse(I, n, n)
+        Acsr1 = build_csr(Matrix(A1))
+        # A2 with the same pattern as A1:
+        rows, cols, _ = findnz(A1)
+        vals2 = randn(length(rows))
+        A2same = sparse(rows, cols, vals2, n, n)
+        Acsr2 = build_csr(Matrix(A2same))
+
+        F1 = csr_qr(Acsr1)
+        R1 = copy(F1.R_nzval)
+        F2 = csr_refactor!(F1, Acsr2)
+        @test F2 === F1
+        # The R values should have changed (different input).
+        @test F2.R_nzval !== R1
+        @test F2.R_nzval != R1
+    end
+
+    @testset "Workspace pool: handles different element types" begin
+        # First a Float64 factor, then attempt a ComplexF64 factor with the
+        # same symbolic — the workspace is element-typed so the second call
+        # should re-allocate a complex workspace transparently.
+        Random.seed!(23)
+        n = 10
+        A_real = randn(n, n) + 3 * I
+        A_cplx = randn(ComplexF64, n, n) + 3 * I
+        Ar_csr = build_csr(A_real)
+        Ac_csr = build_csr(A_cplx)
+
+        sym = csr_analyze(Ar_csr; ordering=:natural)
+        Fr = csr_factor(Ar_csr, sym)
+        # Factor a complex matrix using the SAME symbolic (it's pattern-
+        # compatible since both are dense n×n). The cached Float64 workspace
+        # should be replaced with a ComplexF64 one without corruption.
+        Fc = csr_factor(Ac_csr, sym)
+        @test eltype(Fc) == ComplexF64
+        br = randn(n); bc = randn(ComplexF64, n)
+        xr = Fr \ br; xc = Fc \ bc
+        @test norm(A_real * xr - br) / norm(br) < 1e-10
+        @test norm(A_cplx * xc - bc) / norm(bc) < 1e-10
+    end
+
     @testset "Symbolic exact R column counts" begin
         # The `rcount` field of CSRQRSymbolic should equal the per-column nnz
         # of the produced R factor (exact under no-cancellation).
