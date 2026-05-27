@@ -788,8 +788,12 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
     w = zeros(Int, n)
     vrows = Vector{Int}(undef, m2)
 
-    V.colptr[1] = 1
-    R.colptr[1] = 1
+    # Hoist field accesses for the inner loops.
+    Vp = V.colptr; Vi = V.rowval; Vx = V.nzval
+    Rp = R.colptr; Ri = R.rowval; Rx = R.nzval
+
+    Vp[1] = 1
+    Rp[1] = 1
     rnz_total = 0
     vnz_total = 0
     rnk = 0
@@ -837,25 +841,26 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
             if p_idx == k
                 continue
             end
-            vc1 = V.colptr[p_idx]; vc2 = V.colptr[p_idx + 1] - 1
+            vc1 = Vp[p_idx]; vc2 = Vp[p_idx + 1] - 1
             bk = beta[p_idx]
             tau = zero(T)
             @simd for vp in vc1:vc2
-                tau += conj(V.nzval[vp]) * x[V.rowval[vp]]
+                tau += conj(Vx[vp]) * x[Vi[vp]]
             end
             if bk != 0 && tau != 0
                 tau_b = T(bk) * tau
                 @simd for vp in vc1:vc2
-                    x[V.rowval[vp]] -= tau_b * V.nzval[vp]
+                    x[Vi[vp]] -= tau_b * Vx[vp]
                 end
             end
             # Emit R[p_idx, k] = x[p_idx]; clear x[p_idx].
-            if rnz_total + 1 > length(R.rowval)
+            if rnz_total + 1 > length(Ri)
                 _grow_csc!(R, rnz_total + 1)
+                Ri = R.rowval; Rx = R.nzval
             end
             rnz_total += 1
-            R.rowval[rnz_total] = p_idx
-            R.nzval[rnz_total] = x[p_idx]
+            Ri[rnz_total] = p_idx
+            Rx[rnz_total] = x[p_idx]
             x[p_idx] = zero(T)
         end
 
@@ -881,17 +886,18 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
 
         # --- 4) Emit R[k,k] and V[:,k], or mark rank-deficient -----------
         # Allocate row for R[k,k] first.
-        if rnz_total + 1 > length(R.rowval)
+        if rnz_total + 1 > length(Ri)
             _grow_csc!(R, rnz_total + 1)
+            Ri = R.rowval; Rx = R.nzval
         end
 
         if nrm2 <= tol2 || vlen == 0
             # Rank-deficient column. R[k,k] = 0 (but emit, so R has a diagonal).
             rnz_total += 1
-            R.rowval[rnz_total] = k
-            R.nzval[rnz_total] = zero(T)
-            R.colptr[k + 1] = rnz_total + 1
-            V.colptr[k + 1] = vnz_total + 1
+            Ri[rnz_total] = k
+            Rx[rnz_total] = zero(T)
+            Rp[k + 1] = rnz_total + 1
+            Vp[k + 1] = vnz_total + 1
             beta[k] = zero(RT)
             # Clear x at v-pattern rows (vrows[1..vlen]).
             for q in 1:vlen
@@ -915,10 +921,10 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
         if vnorm2 <= zero(RT)
             # Pathological: H = I. Treat as rank-deficient pivot.
             rnz_total += 1
-            R.rowval[rnz_total] = k
-            R.nzval[rnz_total] = T(alpha)
-            R.colptr[k + 1] = rnz_total + 1
-            V.colptr[k + 1] = vnz_total + 1
+            Ri[rnz_total] = k
+            Rx[rnz_total] = T(alpha)
+            Rp[k + 1] = rnz_total + 1
+            Vp[k + 1] = vnz_total + 1
             beta[k] = zero(RT)
             for q in 1:vlen
                 x[vrows[q]] = zero(T)
@@ -933,30 +939,31 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
 
         # Emit R[k, k] = alpha.
         rnz_total += 1
-        R.rowval[rnz_total] = k
-        R.nzval[rnz_total] = T(alpha)
-        R.colptr[k + 1] = rnz_total + 1
+        Ri[rnz_total] = k
+        Rx[rnz_total] = T(alpha)
+        Rp[k + 1] = rnz_total + 1
 
         # Emit V[:,k]: first slot is row k with value v1; remaining slots are
         # vrows[2..vlen] with NONZERO values x[vrows[q]] only.
         # Skipping exact zeros keeps V columns numerically sparse: rows marked
         # by the apply-step row-tracking but cancelled to 0 by Householder
         # arithmetic don't pollute future apply walks.
-        if vnz_total + vlen > length(V.rowval)
+        if vnz_total + vlen > length(Vi)
             _grow_csc!(V, vnz_total + vlen)
+            Vi = V.rowval; Vx = V.nzval
         end
         vnz_total += 1
-        V.rowval[vnz_total] = k
-        V.nzval[vnz_total] = v1
+        Vi[vnz_total] = k
+        Vx[vnz_total] = v1
         for q in 2:vlen
             xv = x[vrows[q]]
             if xv != zero(T)
                 vnz_total += 1
-                V.rowval[vnz_total] = vrows[q]
-                V.nzval[vnz_total] = xv
+                Vi[vnz_total] = vrows[q]
+                Vx[vnz_total] = xv
             end
         end
-        V.colptr[k + 1] = vnz_total + 1
+        Vp[k + 1] = vnz_total + 1
 
         beta[k] = beta_k
         rnk += 1
@@ -968,12 +975,12 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
     end
 
     # Trim V/R to actual sizes.
-    resize!(V.rowval, vnz_total); resize!(V.nzval, vnz_total)
-    resize!(R.rowval, rnz_total); resize!(R.nzval, rnz_total)
+    resize!(Vi, vnz_total); resize!(Vx, vnz_total)
+    resize!(Ri, rnz_total); resize!(Rx, rnz_total)
 
     return CSRQRFactorization{T, RT}(sym.m, sym.n,
-        V.colptr, V.rowval, V.nzval,
-        R.colptr, R.rowval, R.nzval,
+        Vp, Vi, Vx,
+        Rp, Ri, Rx,
         beta, rnk, tol_use, sym)
 end
 
