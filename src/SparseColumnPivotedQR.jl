@@ -839,12 +839,18 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
         end
 
         # --- Set R[k, k] = alpha; drop R[i, k] for i > k (they go to v storage) ---
+        # The apply step preserved x_pos[q] (the column-k entry position in row i),
+        # because it only overwrote positions start = x_pos[q] + 1 onward. Reuse it
+        # to skip a redundant binary search.
         @inbounds begin
             ck = R_cols[k]; vk = R_vals[k]
-            idx = searchsortedfirst(ck, k)
-            if idx <= length(ck) && ck[idx] == k
-                vk[idx] = T(alpha)
+            pos1 = x_pos[1]
+            if pos1 != 0
+                # Row k already had column k.
+                vk[pos1] = T(alpha)
             else
+                # Insert column k at the right sorted position in row k.
+                idx = searchsortedfirst(ck, k)
                 insert!(ck, idx, k)
                 insert!(vk, idx, T(alpha))
             end
@@ -852,7 +858,14 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
         @inbounds for q in 1:nrows_v
             i = x_idx[q]
             i == k && continue
-            row_remove!(R_cols[i], R_vals[i], k)
+            pos = x_pos[q]
+            ci_i = R_cols[i]; vi_i = R_vals[i]
+            if pos != 0 && pos <= length(ci_i) && ci_i[pos] == k
+                deleteat!(ci_i, pos)
+                deleteat!(vi_i, pos)
+            else
+                row_remove!(ci_i, vi_i, k)
+            end
         end
 
         # --- Store Householder vector step-wise ---
