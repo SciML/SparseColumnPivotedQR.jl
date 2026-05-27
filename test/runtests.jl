@@ -365,6 +365,34 @@ end
         @test norm(Q * R_ext - PAq) < 1e-10
     end
 
+    @testset "drop_tol prunes V columns and stays within tolerance" begin
+        Random.seed!(31)
+        n = 80
+        A = sprand(Float64, n, n, 0.05) + 4 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+
+        F0 = csr_qr(Acsr; ordering = :natural)
+        F1 = csr_qr(Acsr; ordering = :natural, drop_tol = 1.0e-8)
+
+        # drop_tol > 0 should at least weakly reduce nnz(V).
+        @test length(F1.V_nzval) <= length(F0.V_nzval)
+
+        x0 = F0 \ b
+        x1 = F1 \ b
+        # The dropped factorization still solves to a small residual; allow
+        # one or two extra orders relative to the exact factor.
+        r0 = norm(A * x0 - b) / norm(b)
+        r1 = norm(A * x1 - b) / norm(b)
+        @test r1 < 1.0e-6
+        @test r1 <= max(r0, 1.0e-12) * 1.0e7
+
+        # drop_tol = 0 is identical to the default factorization.
+        F2 = csr_qr(Acsr; ordering = :natural, drop_tol = 0)
+        @test F2.V_nzval == F0.V_nzval
+        @test F2.beta == F0.beta
+    end
+
     @testset "Numerically-zero column triggers value-aware repivot" begin
         # A is 6x6 full rank except column 4 which is numerically zero.
         Random.seed!(16)

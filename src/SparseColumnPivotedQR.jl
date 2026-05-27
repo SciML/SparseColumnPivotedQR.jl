@@ -527,7 +527,7 @@ function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:default) where {B
 end
 
 """
-    csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing) -> CSRQRFactorization
+    csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing, drop_tol=0) -> CSRQRFactorization
 
 Numeric factorization given a `CSRQRSymbolic`. Implements the Davis
 `cs_qr` algorithm (scatter–apply–emit on a dense workspace) with the V/R
@@ -538,10 +538,19 @@ Columns whose post-Householder diagonal magnitude falls below `tol` are
 flagged as rank-deficient: `V[:,k] = 0`, `β_k = 0`, `R[k,k] = 0`. The
 numerical rank is the count of columns whose diagonal magnitude is above
 threshold.
+
+`drop_tol=0` (default) keeps every nonzero in each Householder vector
+`V[:, k]`. Setting `drop_tol > 0` discards entries with
+`|v_i| <= drop_tol * ‖v‖` and recomputes `β_k` for the truncated vector;
+the resulting factorization is an *approximate* QR (residual `‖A x - b‖`
+grows with `drop_tol`) but subsequent `apply_QH` / `apply_Q` over fewer
+nonzeros becomes cheaper. Typical safe values are `1e-12` to `1e-8` —
+larger values trade accuracy for fill.
 """
 function csr_factor(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
-                    tol::Union{Nothing, Real}=nothing) where {Bi, T}
-    return _factor_kernel(A, sym, tol)
+                    tol::Union{Nothing, Real}=nothing,
+                    drop_tol::Real=0) where {Bi, T}
+    return _factor_kernel(A, sym, tol, real(T)(drop_tol))
 end
 
 """
@@ -557,9 +566,10 @@ for matrices whose columns are already well-ordered.
 """
 function csr_qr(A::SparseMatrixCSR{Bi, T};
                 tol::Union{Nothing, Real}=nothing,
-                ordering::Symbol=:default) where {Bi, T}
+                ordering::Symbol=:default,
+                drop_tol::Real=0) where {Bi, T}
     sym = csr_analyze(A; ordering=ordering)
-    return csr_factor(A, sym; tol=tol)
+    return csr_factor(A, sym; tol=tol, drop_tol=drop_tol)
 end
 
 """
@@ -573,12 +583,14 @@ Returns a fresh `CSRQRFactorization` (the original is unchanged).
 """
 function csr_refactor!(F::CSRQRFactorization{T},
                        A::SparseMatrixCSR{Bi};
-                       tol::Union{Nothing, Real}=nothing) where {T, Bi}
+                       tol::Union{Nothing, Real}=nothing,
+                       drop_tol::Real=0) where {T, Bi}
+    dt = real(T)(drop_tol)
     if _pattern_matches(F.sym, A)
-        return _factor_kernel(A, F.sym, tol)
+        return _factor_kernel(A, F.sym, tol, dt)
     else
         sym = csr_analyze(A; ordering=F.sym.ordering)
-        return _factor_kernel(A, sym, tol)
+        return _factor_kernel(A, sym, tol, dt)
     end
 end
 
@@ -587,7 +599,8 @@ end
 # ---------------------------------------------------------------------------
 
 function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
-                         tol::Union{Nothing, Real}) where {Bi, T}
+                         tol::Union{Nothing, Real},
+                         drop_tol::Real=zero(real(T))) where {Bi, T}
     m, n = size(A)
     (m == sym.m && n == sym.n) ||
         throw(DimensionMismatch("A is $m x $n but symbolic is $(sym.m) x $(sym.n)"))
@@ -616,7 +629,8 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     colptr_S, rowval_S, nzval_S =
         _permute_pq(colptr_A, rowval_A, nzval_A, sym_use.pinv, sym_use.q, m, n)
 
-    return _csc_qr_numeric(colptr_S, rowval_S, nzval_S, sym_use, tol_use, tol2)
+    return _csc_qr_numeric(colptr_S, rowval_S, nzval_S, sym_use,
+                           tol_use, tol2, RT(drop_tol))
 end
 
 # CSR -> CSC of A, plus per-column squared norms and total ||A||_F^2. The
@@ -810,7 +824,10 @@ end
 # Numeric loop. Returns a CSRQRFactorization.
 function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
                          nzval::Vector{T}, sym::CSRQRSymbolic,
-                         tol_use::RT, tol2::RT) where {T, RT}
+                         tol_use::RT, tol2::RT,
+                         drop_tol::RT=zero(RT)) where {T, RT}
+    drop_active = drop_tol > zero(RT)
+    drop_tol2 = drop_tol * drop_tol
     m, n, m2 = sym.m, sym.n, sym.m2
     parent = sym.parent
     leftmost = sym.leftmost
@@ -986,6 +1003,12 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
         # Skipping exact zeros keeps V columns numerically sparse: rows marked
         # by the apply-step row-tracking but cancelled to 0 by Householder
         # arithmetic don't pollute future apply walks.
+        #
+        # If `drop_tol > 0` is in effect we additionally drop entries
+        # j >= 2 whose magnitude satisfies |x[vrows[q]]|^2 <= drop_tol^2 *
+        # vnorm2, and then recompute β_k from the surviving |v|^2 so that
+        # H̃ = I - β̃ ṽ ṽ^T remains a proper Householder of the truncated ṽ.
+        # The diagonal v1 is never dropped.
         if vnz_total + vlen > length(Vi)
             _grow_csc!(V, vnz_total + vlen)
             Vi = V.rowval; Vx = V.nzval
@@ -993,12 +1016,27 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
         vnz_total += 1
         Vi[vnz_total] = k
         Vx[vnz_total] = v1
-        for q in 2:vlen
-            xv = x[vrows[q]]
-            if xv != zero(T)
-                vnz_total += 1
-                Vi[vnz_total] = vrows[q]
-                Vx[vnz_total] = xv
+        if drop_active
+            thr_drop2 = drop_tol2 * vnorm2
+            new_vnorm2 = abs2(v1)
+            for q in 2:vlen
+                xv = x[vrows[q]]
+                if xv != zero(T) && abs2(xv) > thr_drop2
+                    vnz_total += 1
+                    Vi[vnz_total] = vrows[q]
+                    Vx[vnz_total] = xv
+                    new_vnorm2 += abs2(xv)
+                end
+            end
+            beta_k = RT(2) / new_vnorm2
+        else
+            for q in 2:vlen
+                xv = x[vrows[q]]
+                if xv != zero(T)
+                    vnz_total += 1
+                    Vi[vnz_total] = vrows[q]
+                    Vx[vnz_total] = xv
+                end
             end
         end
         Vp[k + 1] = vnz_total + 1
