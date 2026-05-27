@@ -15,42 +15,6 @@ export csr_qr, csr_analyze, csr_factor, csr_refactor!,
     return Bi == 1 ? 0 : 1
 end
 
-# ---------------------------------------------------------------------------
-# CSC-internal layout for V and R during numeric phase.
-# ---------------------------------------------------------------------------
-#
-# Both V (Householder vectors) and R (upper-triangular factor) are kept in
-# compressed-column form: colptr (length n+1), rowval and nzval (length =
-# total nnz). Column k of V is rowval[colptr[k]:colptr[k+1]-1] and same for
-# nzval. Same for R.
-#
-# Pre-sized exactly from the symbolic phase (subject to per-step growth if
-# the conservative bound was undershot — handled by `_grow_csc!`).
-
-mutable struct _CSCBuf{T}
-    m::Int
-    n::Int
-    colptr::Vector{Int}
-    rowval::Vector{Int}
-    nzval::Vector{T}
-end
-
-@inline function _alloc_csc(::Type{T}, m::Int, n::Int, nzmax::Int) where {T}
-    # colptr left uninitialized; the caller sets colptr[1] = 1 and writes
-    # colptr[k+1] at the end of each step.
-    return _CSCBuf{T}(m, n, Vector{Int}(undef, n + 1),
-                      Vector{Int}(undef, max(nzmax, 1)),
-                      Vector{T}(undef, max(nzmax, 1)))
-end
-
-@inline function _grow_csc!(B::_CSCBuf{T}, needed::Int) where {T}
-    L = length(B.rowval)
-    new_L = max(2 * L, needed)
-    resize!(B.rowval, new_L)
-    resize!(B.nzval, new_L)
-    return nothing
-end
-
 # Grow a (rowval, nzval) pair so that both have at least `needed` capacity.
 # Used by the numeric kernel to expand V/R output buffers if the symbolic
 # bound was undershot.
@@ -559,11 +523,16 @@ end
 """
     csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing) -> CSRQRFactorization
 
-Numeric refactorization. If the sparsity pattern of `A` matches the one
-captured in `F.sym`, the symbolic is reused (skipping the etree / `pinv` /
-`leftmost` work). Otherwise a fresh analyze+factor is performed.
+Numeric refactorization, mutating `F` in place. If the sparsity pattern of
+`A` matches the one captured in `F.sym`, the symbolic is reused (skipping
+the etree / `pinv` / `leftmost` work) and the pre-allocated numeric
+workspace on the symbolic is reused — steady-state calls allocate nothing.
+Otherwise a fresh analyze is performed (and a new workspace lazily built)
+before refactoring.
 
-Returns a fresh `CSRQRFactorization` (the original is unchanged).
+`F`'s `V_*`, `R_*`, `beta` buffers are overwritten with the new values
+(growing only if the previous bounds were undersized). The return value is
+`F` itself.
 """
 function csr_refactor!(F::CSRQRFactorization{T},
                        A::SparseMatrixCSR{Bi};
