@@ -99,37 +99,38 @@ end
         @test norm(Adense * x - b) / max(norm(b), 1.0) < 1e-8
     end
 
-    @testset "User matrices (199x199, mix of rank-deficient)" begin
-        dir = "/home/crackauc/.claude/uploads/d279ff12-71e6-4faf-b1ac-6715899a256b"
-        if isdir(dir)
-            files = sort(readdir(dir; join=true))
-            for f in files
-                text = read(f, String)
-                lines = split(text, '\n'; keepempty=false)
-                A = eval(Meta.parse(strip(lines[1])))
-                b = eval(Meta.parse(strip(lines[2])))
-                Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
-                F = csr_qr(Acsr)
-                Fspqr = qr(A)
-                xspqr = Fspqr \ b
-                x = F \ b
-                if all(isfinite, b)
-                    @test all(isfinite, x)
-                    # Residuals should match SPQR to a few ulps of ||b|| or matrix scale
-                    rmy = norm(A * x - b)
-                    rspqr = norm(A * xspqr - b)
-                    # Either both are essentially zero (full-rank well-conditioned),
-                    # or the LS residual matches SPQR's basic solver.
-                    scale = max(rspqr, 1e-12 * norm(b))
-                    @test rmy <= 1e-8 + 2 * scale
-                else
-                    # NaN in b: x should be all NaN (or non-finite); matches SPQR.
-                    @test count(!isfinite, x) == count(!isfinite, xspqr) ||
-                          count(!isfinite, x) > 0
-                end
+    @testset "Bundled 199x199 matrices (mix of rank-deficient)" begin
+        # Test fixtures checked in under `test/matrices/`. Each file contains
+        # `sparse(...)` on line 1 and a `b` vector on line 2. See
+        # `test/matrices/README.md` for provenance.
+        dir = joinpath(@__DIR__, "matrices")
+        files = sort(filter(f -> endswith(f, ".txt"),
+                            readdir(dir; join=true)))
+        @test !isempty(files)
+        for f in files
+            text = read(f, String)
+            lines = split(text, '\n'; keepempty=false)
+            A = eval(Meta.parse(strip(lines[1])))
+            b = eval(Meta.parse(strip(lines[2])))
+            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            F = csr_qr(Acsr)
+            Fspqr = qr(A)
+            xspqr = Fspqr \ b
+            x = F \ b
+            if all(isfinite, b)
+                @test all(isfinite, x)
+                # Residuals should match SPQR to a few ulps of ||b|| or matrix scale
+                rmy = norm(A * x - b)
+                rspqr = norm(A * xspqr - b)
+                # Either both are essentially zero (full-rank well-conditioned),
+                # or the LS residual matches SPQR's basic solver.
+                scale = max(rspqr, 1e-12 * norm(b))
+                @test rmy <= 1e-8 + 2 * scale
+            else
+                # NaN in b: x should be all NaN (or non-finite); matches SPQR.
+                @test count(!isfinite, x) == count(!isfinite, xspqr) ||
+                      count(!isfinite, x) > 0
             end
-        else
-            @info "User matrix directory not available; skipping."
         end
     end
 
