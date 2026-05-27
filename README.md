@@ -30,16 +30,17 @@ matrices produces NaN; this code matches SPQR's residual to a few ulps.
 
 ```julia
 using SparseArrays, SparseMatricesCSR, SparseColumnPivotedQR
+using AMD  # enables the AMD column ordering; recommended
 
 Acsc = sparse(...)
 Acsr = SparseMatrixCSR(transpose(sparse(transpose(Acsc))))
 
 # --- One-shot (analyze + factor in one call) ---
-F = csr_qr(Acsr)                          # default ordering = :natural
-F = csr_qr(Acsr; ordering=:amd, tol=1e-10)
+F = csr_qr(Acsr)                          # default ordering = :amd when AMD is loaded
+F = csr_qr(Acsr; ordering=:natural)       # opt out for already-well-ordered matrices
 
 # --- Symbolic / numeric split (recommended for repeated factor with same pattern) ---
-sym = csr_analyze(Acsr; ordering=:amd)    # column ordering, etree, row counts
+sym = csr_analyze(Acsr)                   # column ordering, etree, row counts
 F   = csr_factor(Acsr, sym; tol=1e-10)    # numeric factorization
 
 # Refactor a matrix with the same sparsity pattern but different values.
@@ -59,16 +60,33 @@ with either `Int32` or `Int64` index types in the CSR.
 
 ### Ordering choices
 
-| ordering   | meaning                                                              |
-|------------|----------------------------------------------------------------------|
-| `:natural` | identity column ordering (default — best on dense-fill matrices)     |
-| `:amd`     | AMD on `AᵀA`, via the `AMD.jl` weak dep (`using AMD` to enable)       |
-| `:colamd`  | currently an alias for `:amd`                                        |
+| ordering    | meaning                                                              |
+|-------------|----------------------------------------------------------------------|
+| `:default`  | **(default)** `:amd` when the AMD.jl extension is loaded, else `:natural` |
+| `:natural`  | identity column ordering (opt-in; ~2× slower than `:amd` on dense-fill matrices) |
+| `:amd`      | AMD on `AᵀA` via the `AMD.jl` weak dep (`using AMD` to enable)        |
+| `:colamd`   | currently an alias for `:amd`                                        |
+| `:adaptive` | build both `:amd` and `:natural` symbolics, keep the one with the shallower column etree (~30 µs overhead vs `:default`) |
+
+The default tries to give every user CXSparse-class performance out of
+the box: as long as `AMD.jl` is loaded (`using AMD` in your code or via
+a transitive dep), `csr_qr(A)` runs with the AMD ordering and matches the
+`refactor!(amd)` row in the benchmark table below. Without AMD loaded
+the default falls back to `:natural`.
 
 The numeric phase is permitted to deviate from the symbolic ordering when a
 candidate column is rank-deficient. With the default `pivot_factor` (`1e-6`
 internally), this happens only when the natural-ordered column has
 essentially zero residual norm.
+
+### Approximate factorization with `drop_tol`
+
+`csr_qr(A; drop_tol = 1e-8)` discards Householder-vector entries with
+`|v_i| <= drop_tol * ‖v‖` and rescales `β_k` for the truncated vector,
+producing a numerically lighter but approximate QR. Useful when the user
+can absorb a larger `‖A x - b‖` in exchange for a smaller V. On the user
+matrices the benefit is modest (~10% at `drop_tol = 1e-8`); kept as a
+non-default opt-in keyword.
 
 ## Algorithm
 
@@ -120,41 +138,55 @@ julia --project=. -e "using Pkg; Pkg.test()"
 ```
 
 Covers identity, full-rank square and tall, structurally singular,
-rank-deficient overdetermined and square, the seven user matrices,
-`ComplexF64`, and the new analyze/factor/refactor API split including AMD
-vs natural ordering. All 49 tests pass.
+rank-deficient overdetermined and square, the seven bundled 199×199 user
+matrices, `ComplexF64`, the analyze/factor/refactor API split, AMD vs
+natural ordering, the `:default` and `:adaptive` ordering selectors, and
+the `drop_tol` approximate-QR knob. 424 tests, all passing.
 
 ## Benchmarks
 
-`bench/bench.jl` measures `factor + solve` on the seven user matrices
-(199×199, 979 nnz, four rank-deficient at rank 198, two non-singular,
-one with NaN in `b`). Numbers from one run on this machine (Julia 1.11,
-single thread, `@benchmark seconds=1` minimum time):
+`bench/bench.jl` measures `factor + solve` on the seven bundled user
+matrices (199×199, 979 nnz, four rank-deficient at rank 198, two
+non-singular, one with NaN in `b`). Numbers from one run on this machine
+(Julia 1.11, single thread, `@benchmark seconds=1` minimum time):
 
 ```
 file                           solver                   time (μs)    ||Ax-b||
 ------------------------------------------------------------------------------
-11fed5ba-linsolve_0.txt        CSR-QR natural               937.1    3.310e-01
-11fed5ba-linsolve_0.txt        CSR-QR amd                   495.9    3.310e-01
-11fed5ba-linsolve_0.txt        CSR-QR refactor! (nat)       903.5    3.310e-01
-11fed5ba-linsolve_0.txt        CSR-QR refactor! (amd)       316.3    3.310e-01
-11fed5ba-linsolve_0.txt        SPQR                         573.2    3.310e-01
-11fed5ba-linsolve_0.txt        CXSparse cs_qr               329.6          NaN
-11fed5ba-linsolve_0.txt        LAPACK xgeqp3               2697.4    3.310e-01
+linsolve_0.txt                 CSR-QR default               511.5    3.310e-01
+linsolve_0.txt                 CSR-QR natural              1004.5    3.310e-01
+linsolve_0.txt                 CSR-QR amd                   514.3    3.310e-01
+linsolve_0.txt                 CSR-QR adaptive              543.3    3.310e-01
+linsolve_0.txt                 CSR-QR refactor! (nat)       976.1    3.310e-01
+linsolve_0.txt                 CSR-QR refactor! (amd)       336.3    3.310e-01
+linsolve_0.txt                 SPQR                         570.2    3.310e-01
+linsolve_0.txt                 CXSparse cs_qr               331.6          NaN
+linsolve_0.txt                 LAPACK xgeqp3               2723.7    3.310e-01
 
-2d9e29f1-linsolve_4.txt        CSR-QR natural               912.7    1.034e-12
-2d9e29f1-linsolve_4.txt        CSR-QR amd                   483.8    2.559e-13
-2d9e29f1-linsolve_4.txt        CSR-QR refactor! (nat)       895.8    1.034e-12
-2d9e29f1-linsolve_4.txt        CSR-QR refactor! (amd)       320.0    2.559e-13
-2d9e29f1-linsolve_4.txt        SPQR                         555.5    2.877e-13
-2d9e29f1-linsolve_4.txt        CXSparse cs_qr               327.5    5.391e-13
-2d9e29f1-linsolve_4.txt        LAPACK xgeqp3               2645.6    9.090e-13
+linsolve_4.txt                 CSR-QR default               501.6    2.559e-13
+linsolve_4.txt                 CSR-QR natural               983.4    1.034e-12
+linsolve_4.txt                 CSR-QR amd                   499.4    2.559e-13
+linsolve_4.txt                 CSR-QR adaptive              528.2    2.559e-13
+linsolve_4.txt                 CSR-QR refactor! (nat)       968.2    1.034e-12
+linsolve_4.txt                 CSR-QR refactor! (amd)       342.8    2.559e-13
+linsolve_4.txt                 SPQR                         557.2    2.877e-13
+linsolve_4.txt                 CXSparse cs_qr               329.1    5.391e-13
+linsolve_4.txt                 LAPACK xgeqp3               2462.5    9.090e-13
 
-(other matrices cluster tightly around the above)
+(the other matrices cluster tightly around the above)
 ```
 
-(`90095c07-linsolve_6.txt` has NaN in `b`, so every solver returns NaN
-— it's a regression check that we don't crash.)
+`linsolve_6.txt` has NaN in `b`, so every solver returns NaN — it's a
+regression check that we don't crash.
+
+### `:default` vs `:natural` (issue #3)
+
+Before this change `csr_qr(A)` defaulted to `:natural` and ran at ~980 µs
+on the user matrices, while the AMD path that's actually competitive
+with CXSparse `cs_qr` was an opt-in at ~510 µs. The convenience entry
+point therefore left ~50% performance on the table for users who didn't
+know to pass `ordering = :amd`. The default now resolves to `:amd` when
+AMD.jl is loaded; `:natural` is preserved as an explicit opt-in.
 
 ### Progression on this workload
 
@@ -220,10 +252,12 @@ apply hot loop is just a SIMD dot product + SIMD AXPY over V[:, p_idx].
   COLAMD implementation in pure Julia would shave a small amount on
   the symbolic pass and might give a slightly better ordering for some
   workloads. For the user matrices the difference is invisible.
-* **No drop tolerance on V columns.** Householder vectors are stored
-  exactly (only literal zeros are dropped). Adding a numerical drop
-  tolerance would shrink V columns and speed up future applies, but
-  would change residual norms — not implemented for safety.
+* **Drop tolerance on V columns (opt-in).** Pass `drop_tol > 0` to
+  `csr_qr` / `csr_factor` / `csr_refactor!` to discard
+  `|v_i| <= drop_tol * ‖v‖` entries during the V emit step (β is
+  recomputed for the truncated vector). The diagonal is never dropped.
+  Empirically saves ~10% on the user matrices at `drop_tol = 1e-8`;
+  larger values quickly blow up the residual, so kept off by default.
 * **No workspace pool.** Each `csr_factor` / `csr_refactor!` allocates
   fresh V / R buffers. A workspace struct that the user could reuse
   across calls would shave another ~30 μs per call, but the API churn

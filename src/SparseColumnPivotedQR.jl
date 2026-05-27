@@ -639,11 +639,13 @@ function csr_qr(A::SparseMatrixCSR{Bi, T};
 end
 
 """
-    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing) -> CSRQRFactorization
+    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing, drop_tol=0) -> CSRQRFactorization
 
 Numeric refactorization. If the sparsity pattern of `A` matches the one
 captured in `F.sym`, the symbolic is reused (skipping the etree / `pinv` /
 `leftmost` work). Otherwise a fresh analyze+factor is performed.
+
+The `drop_tol` keyword has the same meaning as in [`csr_factor`](@ref).
 
 Returns a fresh `CSRQRFactorization` (the original is unchanged).
 """
