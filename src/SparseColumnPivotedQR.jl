@@ -501,6 +501,7 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     w = zeros(T, n)
     w_touched = falses(n)
     mark_cols = Int[]
+    sizehint!(mark_cols, n)
     new_cols_buf = Int[]
     new_vals_buf = T[]
     sizehint!(new_cols_buf, 2n)
@@ -508,6 +509,9 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     x_idx = Int[]
     x_val = T[]
     v_vals = T[]
+    # x_pos[q] = position in R_cols[x_idx[q]] of the column-k entry (cached during gather,
+    # reused during the Householder apply step to avoid a second searchsortedfirst).
+    x_pos = Int[]
 
     # Threshold: prefer the AMD-ordered column at position k (sparsity-preserving)
     # unless it's substantially rank-deficient relative to the best remaining.
@@ -616,7 +620,7 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
         end
 
         # --- Gather column-k entries from rows k..m to build Householder x ---
-        empty!(x_idx); empty!(x_val)
+        empty!(x_idx); empty!(x_val); empty!(x_pos)
         @inbounds for i in k:m
             ci = R_cols[i]; vi = R_vals[i]
             idx = searchsortedfirst(ci, k)
@@ -625,6 +629,7 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
                 if v != 0
                     push!(x_idx, i)
                     push!(x_val, v)
+                    push!(x_pos, idx)
                 end
             end
         end
@@ -638,6 +643,9 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
         if x_idx[1] != k
             pushfirst!(x_idx, k)
             pushfirst!(x_val, zero(T))
+            # Row k didn't have column k yet; will be inserted later. Sentinel value 0
+            # indicates "no cached position" — the apply step will recompute via search.
+            pushfirst!(x_pos, 0)
         end
 
         # --- Compute Householder reflector: alpha, v, tau ---
@@ -682,7 +690,9 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
             end
             cvi_q = conj(vi_q)
             ci = R_cols[i]; vi = R_vals[i]
-            start = searchsortedfirst(ci, k + 1)
+            # Tail starts immediately after the cached column-k position (if any).
+            pos = x_pos[q]
+            start = (pos == 0) ? searchsortedfirst(ci, k + 1) : pos + 1
             for p2 in start:length(ci)
                 j = ci[p2]
                 if !w_touched[j]
@@ -703,11 +713,20 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
             end
             factor = tau_k * vi_q
             ci = R_cols[i]; vi = R_vals[i]
-            start = searchsortedfirst(ci, k + 1)
+            pos = x_pos[q]
+            start = (pos == 0) ? searchsortedfirst(ci, k + 1) : pos + 1
             la = length(ci) - start + 1
             lb = length(mark_cols)
 
-            empty!(new_cols_buf); empty!(new_vals_buf)
+            # Fast path: if there's no overlap between the existing tail and the
+            # marked columns AND no fill-in shrinks (all new entries are fill-in),
+            # do an in-place merge by appending. We detect this by scanning once.
+            # General path: merge into the scratch buffer, then copy back.
+            # Resize the scratch buffer up front so push!() doesn't re-grow.
+            new_max = la + lb
+            resize!(new_cols_buf, new_max)
+            resize!(new_vals_buf, new_max)
+            nwrite = 0
 
             a = 1; b = 1
             while a <= la && b <= lb
@@ -716,43 +735,53 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
                 if ca == cb
                     nv = vi[start + a - 1] - factor * w[cb]
                     if nv != 0
-                        push!(new_cols_buf, ca); push!(new_vals_buf, nv)
+                        nwrite += 1
+                        new_cols_buf[nwrite] = ca
+                        new_vals_buf[nwrite] = nv
                     end
                     a += 1; b += 1
                 elseif ca < cb
-                    push!(new_cols_buf, ca); push!(new_vals_buf, vi[start + a - 1])
+                    nwrite += 1
+                    new_cols_buf[nwrite] = ca
+                    new_vals_buf[nwrite] = vi[start + a - 1]
                     a += 1
                 else
                     nv = -factor * w[cb]
                     if nv != 0
-                        push!(new_cols_buf, cb); push!(new_vals_buf, nv)
+                        nwrite += 1
+                        new_cols_buf[nwrite] = cb
+                        new_vals_buf[nwrite] = nv
                     end
                     b += 1
                 end
             end
             while a <= la
-                push!(new_cols_buf, ci[start + a - 1]); push!(new_vals_buf, vi[start + a - 1])
+                nwrite += 1
+                new_cols_buf[nwrite] = ci[start + a - 1]
+                new_vals_buf[nwrite] = vi[start + a - 1]
                 a += 1
             end
             while b <= lb
                 cb = mark_cols[b]
                 nv = -factor * w[cb]
                 if nv != 0
-                    push!(new_cols_buf, cb); push!(new_vals_buf, nv)
+                    nwrite += 1
+                    new_cols_buf[nwrite] = cb
+                    new_vals_buf[nwrite] = nv
                 end
                 b += 1
             end
 
-            new_tail_len = length(new_cols_buf)
-            new_total_len = start - 1 + new_tail_len
+            new_total_len = start - 1 + nwrite
             old_total_len = length(ci)
             if new_total_len != old_total_len
                 resize!(ci, new_total_len)
                 resize!(vi, new_total_len)
             end
-            for t in 1:new_tail_len
-                ci[start + t - 1] = new_cols_buf[t]
-                vi[start + t - 1] = new_vals_buf[t]
+            # Copy nwrite elements from scratch buffer into ci/vi at offset start-1.
+            if nwrite > 0
+                copyto!(ci, start, new_cols_buf, 1, nwrite)
+                copyto!(vi, start, new_vals_buf, 1, nwrite)
             end
         end
 
