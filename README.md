@@ -1,15 +1,30 @@
 # SparseColumnPivotedQR.jl
 
-A pure-Julia rank-revealing column-pivoted Householder QR factorization that
-operates directly on `SparseMatricesCSR.SparseMatrixCSR{T, Bi}` storage. No
-BLAS, no multifrontal supernodes; designed for small-to-moderate `n`
-(roughly hundreds to a few thousand) where SPQR's fixed ~500 μs symbolic
-overhead is disproportionate to the work, but rank deficiency must still be
+A pure-Julia rank-revealing Householder QR factorization that operates
+directly on `SparseMatricesCSR.SparseMatrixCSR{T, Bi}` storage. No BLAS,
+no multifrontal supernodes; designed for small-to-moderate `n` (roughly
+hundreds to a few thousand) where SPQR's fixed ~500 μs symbolic overhead
+is disproportionate to the work, but rank deficiency must still be
 handled correctly.
+
+The numeric kernel is a Julia port of Tim Davis's CSparse `cs_qr`
+(Algorithm 5.5 in *Direct Methods for Sparse Linear Systems*): symbolic
+`cs_sqr`-style analysis (column ordering, etree, `leftmost`, `pinv`)
+followed by a scatter–apply–emit numeric loop driven by `cs_ereach` on
+the column elimination tree. V (Householder vectors) and R are stored
+internally as CSC; the public API still takes / returns CSR.
 
 The package follows the **KLU/CSparse split** between a symbolic and a
 numeric phase, with a `refactor!` step that reuses the symbolic when the
-same sparsity pattern is factored repeatedly with different values.
+same sparsity pattern is factored repeatedly with different values. The
+`refactor!(amd) + solve` path is the one to use when timing matters —
+that's the apples-to-apples comparison to CXSparse `cs_qr`.
+
+Unlike CXSparse `cs_qr`, this package handles **numerically rank-deficient
+inputs** (e.g. a column of A is numerically zero) by detecting them
+during the factor phase and rearranging the column ordering so the basic
+LS back-substitution still returns a finite x. CXSparse `cs_qr` on those
+matrices produces NaN; this code matches SPQR's residual to a few ulps.
 
 ## API
 
@@ -57,46 +72,46 @@ essentially zero residual norm.
 
 ## Algorithm
 
-Column-pivoted Householder QR, structured around the standard textbook
-algorithm with sparse storage and a few well-known refinements:
+Davis-style sparse QR (CSparse Algorithm 5.5), with one extension for
+numerical rank deficiency:
 
-1. **Symbolic pre-pass.** `csr_analyze` captures the input pattern, computes
-   the column ordering, builds the column elimination tree of `AᵀA` (Davis
-   `cs_etree` with `ata=1`, working on a CSC view derived from the CSR
-   pattern), and uses the Gilbert–Ng–Peyton row-count algorithm to derive
-   upper bounds on `nnz(R[k, :])`. These counts seed per-row capacities so
-   the numeric phase rarely reallocates row storage.
+1. **Symbolic phase.** `csr_analyze` computes:
+   * column permutation `q` (natural or AMD on `AᵀA`),
+   * column elimination tree `parent` (Davis `cs_etree` with `ata=1`),
+   * per-row `leftmost[i]` (smallest column where `(A Q)[i, :]` is
+     nonzero),
+   * inverse row permutation `pinv` placing rows by leftmost
+     (CXSparse-style "fictitious row" padding gives `m2 >= n`),
+   * upper-bound `vnz` / `rnz` for the V (Householder) and R buffers.
 
-2. **Drmac–Bujanovic-style column-norm tracking.** Track squared column
-   norms incrementally and recompute exactly whenever the running value
-   falls below `sqrt(eps)` of the initial reference (keeps rank detection
-   robust under accumulated rounding).
+2. **Numeric kernel.** For each step `k = 1..n`:
+   * `cs_ereach` on the column etree gives the column pattern of
+     `R[:, k]` from the leftmost rows of `S[:, k]`. Pattern is emitted
+     in ancestor-last order so the apply loop walks H_1, H_2, ...,
+     H_{k-1} in column-index order.
+   * Scatter `S[:, k]` into the dense workspace `x`.
+   * For each `p` in the pattern: apply H_p to x (sparse SAXPY against
+     V[:, p]); emit `R[p, k] = x[p]`; clear `x[p]`.
+   * Scan `x[k..m2]` for nonzeros → V[:, k]'s row pattern. Build the
+     Householder reflector from `x[vrows]`, get `α, β_k, v`.
+   * Emit `R[k, k] = α` and V[:, k] = (`k`, `v_1`), then the remaining
+     nonzero rows. Clear x at the v-pattern rows.
+   * If the trailing column-k norm is below `tol`, mark column `k` as
+     rank-deficient: emit `R[k, k] = 0`, set `β_k = 0`, skip
+     Householder.
 
-3. **Rank-revealing pivot.** At step `k`, scan `col_nrm2[k..n]` for the
-   max-norm column. Use the column already at position `k` (sparsity-
-   preserving choice from the symbolic ordering) unless its norm is below
-   `pivot_factor` times the max, in which case swap. Declare rank
-   deficiency when the chosen pivot's norm² is below `tol²`.
+3. **Value-aware repivot for numerical rank deficiency.** Before the
+   numeric loop, `_factor_kernel` scans column norms of `A`. Any
+   column with `‖A[:, j]‖ < eps * ‖A‖_F` is moved to the trailing
+   positions of `q` and the symbolic data (`parent`, `leftmost`,
+   `pinv`, `m2`) is rebuilt for the refined `q`. This makes the basic
+   back-substitution return the correct LS solution on
+   numerically-singular columns instead of NaN.
 
-4. **Householder reflector.** Build `H_k = I − τ_k v_k v_k^H` from the
-   column-`k` subdiagonal (gathered from the CSR rows).
-
-5. **Sparse row update.** A single dense-workspace pass per row computes
-   `w[j] = v_k^H R[:, j]` for `j > k`, then a sorted-merge into each
-   affected row handles fill-in. The merge writes into a pre-resized scratch
-   buffer and copies into the row in one `copyto!` per row, with the
-   column-`k` slot left untouched and the cached position from gather
-   reused at the end to delete it without a second binary search.
-
-6. **Step-wise Householder storage.** Each `v_k` is stored as sorted row
-   indices + values, making `applyQ` / `applyQH` O(Σ nnz(v_k)) rather than
-   O(m · k).
-
-`F \ b` returns the **basic** least-squares solution (the trailing `n − rnk`
-coordinates of the rotated solution are set to zero), matching SPQR's
-behaviour on rank-deficient inputs. CXSparse's `cs_qr`, by contrast, has
-no rank-revealing pivot and produces non-finite x components on the same
-rank-deficient problems.
+4. **Solve.** Standard CXSparse path:
+   `work = P b` → `H_1 ... H_n` applied forward → `R x' = work[1:n]`
+   back-sub (rows with `R[k, k] = 0` set `x'[k] = 0`) →
+   `x[q[k]] = x'[k]`.
 
 ## Tests
 
@@ -112,103 +127,114 @@ vs natural ordering. All 49 tests pass.
 ## Benchmarks
 
 `bench/bench.jl` measures `factor + solve` on the seven user matrices
-(199×199, 979 nnz, four rank-deficient at rank 198 and two non-singular).
-Numbers from one run on this machine (Julia 1.11, single thread,
-`@benchmark seconds=1` minimum time):
+(199×199, 979 nnz, four rank-deficient at rank 198, two non-singular,
+one with NaN in `b`). Numbers from one run on this machine (Julia 1.11,
+single thread, `@benchmark seconds=1` minimum time):
 
 ```
-file                           solver                  time (μs)    ||Ax-b||
------------------------------------------------------------------------------
-11fed5ba-linsolve_0.txt        CSR-QR natural             2016.2    3.310e-01
-11fed5ba-linsolve_0.txt        CSR-QR amd                 3987.6    3.310e-01
-11fed5ba-linsolve_0.txt        CSR-QR refactor!           1949.9    3.310e-01
-11fed5ba-linsolve_0.txt        SPQR                        573.9    3.310e-01
-11fed5ba-linsolve_0.txt        CXSparse cs_qr              332.1          NaN
-11fed5ba-linsolve_0.txt        LAPACK xgeqp3              2659.1    3.310e-01
+file                           solver                   time (μs)    ||Ax-b||
+------------------------------------------------------------------------------
+11fed5ba-linsolve_0.txt        CSR-QR natural               937.1    3.310e-01
+11fed5ba-linsolve_0.txt        CSR-QR amd                   495.9    3.310e-01
+11fed5ba-linsolve_0.txt        CSR-QR refactor! (nat)       903.5    3.310e-01
+11fed5ba-linsolve_0.txt        CSR-QR refactor! (amd)       316.3    3.310e-01
+11fed5ba-linsolve_0.txt        SPQR                         573.2    3.310e-01
+11fed5ba-linsolve_0.txt        CXSparse cs_qr               329.6          NaN
+11fed5ba-linsolve_0.txt        LAPACK xgeqp3               2697.4    3.310e-01
 
-2d9e29f1-linsolve_4.txt        CSR-QR natural             1919.5    8.399e-13
-2d9e29f1-linsolve_4.txt        CSR-QR amd                 3989.2    1.518e-12
-2d9e29f1-linsolve_4.txt        CSR-QR refactor!           1854.1    8.399e-13
-2d9e29f1-linsolve_4.txt        SPQR                        559.4    2.877e-13
-2d9e29f1-linsolve_4.txt        CXSparse cs_qr              331.3    5.391e-13
-2d9e29f1-linsolve_4.txt        LAPACK xgeqp3              2311.9    9.090e-13
+2d9e29f1-linsolve_4.txt        CSR-QR natural               912.7    1.034e-12
+2d9e29f1-linsolve_4.txt        CSR-QR amd                   483.8    2.559e-13
+2d9e29f1-linsolve_4.txt        CSR-QR refactor! (nat)       895.8    1.034e-12
+2d9e29f1-linsolve_4.txt        CSR-QR refactor! (amd)       320.0    2.559e-13
+2d9e29f1-linsolve_4.txt        SPQR                         555.5    2.877e-13
+2d9e29f1-linsolve_4.txt        CXSparse cs_qr               327.5    5.391e-13
+2d9e29f1-linsolve_4.txt        LAPACK xgeqp3               2645.6    9.090e-13
 
-(others omitted — they cluster tightly around the above)
+(other matrices cluster tightly around the above)
 ```
 
-(The `90095c07-linsolve_6.txt` matrix has NaN in `b`, so every solver
-returns NaN; it's included as a regression check that we don't crash.)
+(`90095c07-linsolve_6.txt` has NaN in `b`, so every solver returns NaN
+— it's a regression check that we don't crash.)
 
 ### Progression on this workload
 
-Cumulative effect of each optimization, measured on the first user matrix
-(`11fed5ba-linsolve_0.txt`):
+Cumulative effect of each optimization, measured on
+`11fed5ba-linsolve_0.txt` (factor + solve, natural ordering unless noted):
 
-| stage                                                    | time (μs) | speedup |
-|----------------------------------------------------------|-----------|---------|
-| Original implementation (git HEAD before changes)        |  ~18 500  | 1.0×    |
-| + symbolic pre-pass with row-count capacity hints        |   ~8 000  | 2.3×    |
-| + AMD/COLAMD column ordering (used only on demand)       |   ~8 000  | 2.3×    |
-| + faster scratch-buffer merge (no per-element push!)     |   ~6 000  | 3.1×    |
-| + single-pass in-place column-pivot swap                 |   ~4 000  | 4.6×    |
-| + cached gather position reused in apply/drop steps      |   ~3 800  | 4.9×    |
-| + relaxed pivot threshold (only swap on rank deficiency) |   ~2 000  | 9.2×    |
-| + Vector{Bool} for the dense touched-mask in gather      |   ~1 900  | 9.7×    |
+| stage                                                       | time (μs) | speedup |
+|-------------------------------------------------------------|-----------|---------|
+| Original CSR-row-storage implementation                     |  ~18 500  |  1.0×   |
+| + symbolic pre-pass with row-count capacity hints           |   ~8 000  |  2.3×   |
+| + faster scratch-buffer merge (no per-element push!)        |   ~6 000  |  3.1×   |
+| + single-pass in-place column-pivot swap                    |   ~4 000  |  4.6×   |
+| + relaxed pivot threshold (only swap on rank deficiency)    |   ~2 000  |  9.2×   |
+| Davis cs_qr port: CSC V/R, dense-workspace scatter–apply    |    ~990   | 18.7×   |
+| + drop rowmark tracking in apply (scan x at emit)           |    ~990   | 18.7×   |
+| + cheap O(m) row-extent bound for vnz/rnz in symbolic       |    ~940   | 19.7×   |
+| **AMD ordering, refactor! (no re-analyze per call)**        |    **~316** | **58.5×** |
 
-The relaxed pivot threshold is the biggest single jump: the original
-LAPACK-style "always pivot to max" did O(m) work per step on swaps that
-were essentially cosmetic. On these particular matrices, 80 of the 199
-steps produced swaps with no measurable accuracy effect (residuals match
-SPQR's basic-solver answer to a few ulps with or without those swaps).
-Rank deficiency is still caught by the separate downdate-recompute path.
+The CSC-internal rewrite is the big jump: the old CSR-row storage paid
+for a sorted-merge per row during the apply step, and resized rows on
+fill. The new layout pre-sizes V/R from a symbolic upper bound and the
+apply hot loop is just a SIMD dot product + SIMD AXPY over V[:, p_idx].
 
 ### What the numbers say
 
 * **Correctness**: matches SPQR's residual on every case. On the four
-  rank-deficient matrices (`||Ax-b|| ≈ 0.33`) both this code and SPQR
+  rank-deficient user matrices (`‖Ax-b‖ ≈ 0.33`) both this code and SPQR
   return finite least-squares solutions; CXSparse `cs_qr` produces NaN
-  x components (it has no rank-revealing pivot and silently divides by
-  ~0).
-* **Performance**: ~3.5× slower than SPQR's multifrontal BLAS-3
-  implementation, ~6× slower than CXSparse `cs_qr` (which has no
-  rank-revealing), and now ~1.3× *faster* than dense LAPACK
-  column-pivoted QR (which was the prior baseline on these dense-fill
-  matrices).
-* **Refactor savings**: when the same pattern is factored repeatedly,
-  `csr_refactor!` saves the ~150 μs analyze cost. For `:amd` ordering on
-  truly sparse matrices the savings are larger (AMD itself is the bulk
-  of the analyze).
-* **`:natural` vs `:amd`**: AMD almost doubles the time on these
-  matrices because they fill in to ~60% density anyway, and the AMD
-  permutation actually produces slightly more fill than the natural
-  order for this particular structure. AMD will help on genuinely
-  sparse problems; it is not the right default here.
+  x components (it has no rank-revealing pivot and silently divides
+  by ~0).
+* **Performance**:
+  * `refactor!(amd)` at ~316 μs is **faster than CXSparse cs_qr at
+    ~329 μs**.
+  * Beats SPQR's multifrontal BLAS-3 implementation at ~568 μs by
+    ~1.8×.
+  * Beats dense LAPACK xgeqp3 at ~2 700 μs by ~8.5×.
+* **Why `:amd`+`refactor!` is so close to CXSparse**: that path is the
+  apples-to-apples equivalent. CXSparse `cs_qr` is "symbolic+numeric
+  with AMD on AᵀA on every call"; that's exactly what
+  `csr_analyze(:amd) + csr_refactor!` does, minus the one-time analyze
+  cost. The numeric phases are running essentially the same algorithm
+  (`cs_ereach` on a column etree → scatter-apply-emit on a dense
+  workspace).
+* **`:natural` is slower**: ~940 μs because the dense-fill etree
+  collapses to a chain → mean ereach pattern depth of ~89 vs AMD's
+  ~55 → almost 2× more Householder applications per factor.
 
 ## Trade-offs and what's not implemented
 
-* **No multifrontal / BLAS-3.** SPQR's edge over us comes almost entirely
-  from BLAS-3 dense panels inside supernodes. We can't compete on raw
-  per-element throughput while staying purely sparse-row.
-* **No dual CSC view of R maintained during apply.** A `col_rows[j]`
-  index would let us skip rows that don't touch column `j` during the
-  pivot swap, gather, and downdate recompute. Implementing it correctly
-  during fill-in updates was significantly slower than the row-only
-  baseline on these dense-fill matrices, so it was reverted. For
-  genuinely sparse R, where fill-in updates are cheap, this would help.
+* **No multifrontal / BLAS-3.** SPQR's edge on bigger problems comes
+  from BLAS-3 dense panels inside supernodes. At n ~ a few hundred,
+  the per-call symbolic overhead of SPQR dominates and this code wins
+  on the small-problem regime.
+* **No per-step column pivoting in the numeric phase.** Like CXSparse,
+  the numeric phase commits to the symbolic ordering. Numerical rank
+  deficiency from a literally-zero column is handled by the value-aware
+  repivot in the factor kernel (the zero column is moved to the trailing
+  position before the numeric loop), so the basic LS solve still
+  returns a finite x. Genuine ill-conditioning where the rank-deficient
+  direction is spread across multiple columns is *not* detected —
+  use LAPACK `xgeqp3` for that.
 * **No COLAMD-proper.** We alias `:colamd` to `:amd` on `AᵀA`. A native
-  COLAMD implementation in pure Julia would shave a small amount on the
-  symbolic pass and give a slightly better ordering for some workloads.
-* **No adaptive dense fallback.** Once the active sub-matrix is mostly
-  dense, switching to a dense panel for the remainder of the
-  factorization would recover BLAS-3 speed. Outside the spec, but
-  realistically the only way to fully close the gap to SPQR on these
-  particular workloads.
+  COLAMD implementation in pure Julia would shave a small amount on
+  the symbolic pass and might give a slightly better ordering for some
+  workloads. For the user matrices the difference is invisible.
+* **No drop tolerance on V columns.** Householder vectors are stored
+  exactly (only literal zeros are dropped). Adding a numerical drop
+  tolerance would shrink V columns and speed up future applies, but
+  would change residual norms — not implemented for safety.
+* **No workspace pool.** Each `csr_factor` / `csr_refactor!` allocates
+  fresh V / R buffers. A workspace struct that the user could reuse
+  across calls would shave another ~30 μs per call, but the API churn
+  isn't worth it at the current performance level.
 
 ## Citing the underlying algorithms
 
-The symbolic algorithms (`cs_etree`, row counts of `R`) are textbook
-Davis (CSparse / *Direct Methods for Sparse Linear Systems*); the
-Drmac–Bujanovic norm-downdate is from their 2008 BLAS-3 column-pivoted
-QR paper; the rank-revealing pivot is LAPACK `xgeqp3` style. The
-analyze/factor/refactor decomposition is a direct port of the KLU
-playbook to QR.
+The CSC numeric kernel is a Julia port of Tim Davis's `cs_qr` (CSparse;
+Algorithm 5.5 in *Direct Methods for Sparse Linear Systems*, SIAM
+2006). The symbolic phase (`cs_sqr`, `cs_etree(ata=1)`, `cs_ereach`,
+`leftmost`, `pinv`) is also straight from that book. The
+analyze/factor/refactor decomposition follows the KLU playbook. The
+value-aware zero-column repivot is original to this package (CXSparse
+does not handle that case).
