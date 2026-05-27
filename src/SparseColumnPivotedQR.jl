@@ -111,6 +111,10 @@ end
 # Convert a SparseMatrixCSR to a list of (cols, vals) row arrays (sorted by col).
 # Applies an optional column permutation: if colperm_inv[j] = new_col, then
 # input column j ends up as column colperm_inv[j] in the output rows.
+#
+# When `rowcap` is provided, allocate each row at the upper-bound capacity
+# directly (Vector{...}(undef, cap)) and shrink to the actual nnz via resize!.
+# This avoids a separate sizehint!() reallocation per row.
 function _csr_to_rows(A::SparseMatrixCSR{Bi, T},
                      colperm_inv::Union{Nothing, Vector{Int}}=nothing,
                      rowcap::Union{Nothing, Vector{Int}}=nothing) where {Bi, T}
@@ -121,13 +125,13 @@ function _csr_to_rows(A::SparseMatrixCSR{Bi, T},
     colval = A.colval
     nzval = A.nzval
     off = getoffset(A)
-    for i in 1:m
+    @inbounds for i in 1:m
         r1 = rowptr[i] + off
         r2 = rowptr[i + 1] + off - 1
         nz = r2 - r1 + 1
         cap = (rowcap === nothing) ? nz : max(rowcap[i], nz)
-        ci = Vector{Int}(undef, nz)
-        vi = Vector{T}(undef, nz)
+        ci = Vector{Int}(undef, cap)
+        vi = Vector{T}(undef, cap)
         k = 1
         if colperm_inv === nothing
             for p in r1:r2
@@ -142,15 +146,28 @@ function _csr_to_rows(A::SparseMatrixCSR{Bi, T},
                 k += 1
             end
         end
-        if !issorted(ci)
-            pp = sortperm(ci)
-            ci = ci[pp]
-            vi = vi[pp]
+        # Sort if needed. We sort only the first nz entries; the tail
+        # storage is unused (length stays at nz after the resize! below).
+        unsorted = false
+        for p in 2:nz
+            if ci[p - 1] > ci[p]
+                unsorted = true
+                break
+            end
         end
-        if cap > nz
-            sizehint!(ci, cap)
-            sizehint!(vi, cap)
+        if unsorted
+            # Sort the first nz entries (the tail beyond nz is undefined memory).
+            view_c = view(ci, 1:nz)
+            view_v = view(vi, 1:nz)
+            pp = sortperm(view_c)
+            ci_sorted = view_c[pp]
+            vi_sorted = view_v[pp]
+            copyto!(view_c, ci_sorted)
+            copyto!(view_v, vi_sorted)
         end
+        # Logical length = nz (the rest of `cap` is reserved capacity).
+        resize!(ci, nz)
+        resize!(vi, nz)
         cols[i] = ci
         vals[i] = vi
     end
@@ -601,21 +618,52 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
         end
 
         # --- Swap columns k and p in R, perm, and norms ---
+        # Single-pass per row: locate k and p simultaneously and apply the
+        # smallest structural change.
         if p != k
+            # `p` may be > or < k in general, but the rank-revealing pivot keeps p >= k
+            # by construction (we pivot from positions k..n). Ensure k_lo < p_hi.
+            k_lo, p_hi = k < p ? (k, p) : (p, k)
             col_nrm2[k], col_nrm2[p] = col_nrm2[p], col_nrm2[k]
             col_nrm2_init[k], col_nrm2_init[p] = col_nrm2_init[p], col_nrm2_init[k]
             perm[k], perm[p] = perm[p], perm[k]
             @inbounds for i in 1:m
                 ci = R_cols[i]; vi = R_vals[i]
-                vk = row_get(ci, vi, k)
-                vp = row_get(ci, vi, p)
-                if vk == 0 && vp == 0
+                L = length(ci)
+                L == 0 && continue
+                # Find idx_lo = position of k_lo (or insertion position).
+                idx_lo = searchsortedfirst(ci, k_lo)
+                has_lo = idx_lo <= L && ci[idx_lo] == k_lo
+                # Find idx_hi >= idx_lo (binary search restricted).
+                idx_hi = searchsortedfirst(view(ci, idx_lo:L), p_hi) + idx_lo - 1
+                has_hi = idx_hi <= L && ci[idx_hi] == p_hi
+                if !has_lo && !has_hi
                     continue
                 end
-                vk != 0 && row_remove!(ci, vi, k)
-                vp != 0 && row_remove!(ci, vi, p)
-                vp != 0 && row_set!(ci, vi, k, vp)
-                vk != 0 && row_set!(ci, vi, p, vk)
+                if has_lo && has_hi
+                    # Both present: swap values in place; no structural change.
+                    vi[idx_lo], vi[idx_hi] = vi[idx_hi], vi[idx_lo]
+                elseif has_lo
+                    # Move k_lo -> p_hi position.
+                    # Shift entries [idx_lo+1 : idx_hi-1] left by one, write p_hi at idx_hi-1.
+                    v_save = vi[idx_lo]
+                    for t in idx_lo:(idx_hi - 2)
+                        ci[t] = ci[t + 1]
+                        vi[t] = vi[t + 1]
+                    end
+                    ci[idx_hi - 1] = p_hi
+                    vi[idx_hi - 1] = v_save
+                else  # has_hi only
+                    # Move p_hi -> k_lo position.
+                    # Shift entries [idx_lo : idx_hi-1] right by one, write k_lo at idx_lo.
+                    v_save = vi[idx_hi]
+                    for t in idx_hi:-1:(idx_lo + 1)
+                        ci[t] = ci[t - 1]
+                        vi[t] = vi[t - 1]
+                    end
+                    ci[idx_lo] = k_lo
+                    vi[idx_lo] = v_save
+                end
             end
         end
 
