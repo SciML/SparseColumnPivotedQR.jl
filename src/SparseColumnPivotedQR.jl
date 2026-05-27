@@ -514,7 +514,7 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     kmax = min(m, n)
     rnk = kmax
 
-    # Reusable workspaces
+    # Reusable workspaces.
     w = zeros(T, n)
     w_touched = falses(n)
     mark_cols = Int[]
@@ -763,25 +763,23 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
             ci = R_cols[i]; vi = R_vals[i]
             pos = x_pos[q]
             start = (pos == 0) ? searchsortedfirst(ci, k + 1) : pos + 1
-            la = length(ci) - start + 1
+            old_total_len = length(ci)
+            la = old_total_len - start + 1
             lb = length(mark_cols)
 
-            # Fast path: if there's no overlap between the existing tail and the
-            # marked columns AND no fill-in shrinks (all new entries are fill-in),
-            # do an in-place merge by appending. We detect this by scanning once.
-            # General path: merge into the scratch buffer, then copy back.
-            # Resize the scratch buffer up front so push!() doesn't re-grow.
+            # Resize scratch buffer to upper bound (la + lb).
             new_max = la + lb
             resize!(new_cols_buf, new_max)
             resize!(new_vals_buf, new_max)
             nwrite = 0
-
+            # Pre-offset for faster ci/vi indexing.
+            sm1 = start - 1
             a = 1; b = 1
             while a <= la && b <= lb
-                ca = ci[start + a - 1]
+                ca = ci[sm1 + a]
                 cb = mark_cols[b]
                 if ca == cb
-                    nv = vi[start + a - 1] - factor * w[cb]
+                    nv = vi[sm1 + a] - factor * w[cb]
                     if nv != 0
                         nwrite += 1
                         new_cols_buf[nwrite] = ca
@@ -791,7 +789,7 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
                 elseif ca < cb
                     nwrite += 1
                     new_cols_buf[nwrite] = ca
-                    new_vals_buf[nwrite] = vi[start + a - 1]
+                    new_vals_buf[nwrite] = vi[sm1 + a]
                     a += 1
                 else
                     nv = -factor * w[cb]
@@ -805,10 +803,11 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
             end
             while a <= la
                 nwrite += 1
-                new_cols_buf[nwrite] = ci[start + a - 1]
-                new_vals_buf[nwrite] = vi[start + a - 1]
+                new_cols_buf[nwrite] = ci[sm1 + a]
+                new_vals_buf[nwrite] = vi[sm1 + a]
                 a += 1
             end
+            # Tail of mark_cols (only fill-in): scan and write.
             while b <= lb
                 cb = mark_cols[b]
                 nv = -factor * w[cb]
@@ -820,8 +819,7 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
                 b += 1
             end
 
-            new_total_len = start - 1 + nwrite
-            old_total_len = length(ci)
+            new_total_len = sm1 + nwrite
             if new_total_len != old_total_len
                 resize!(ci, new_total_len)
                 resize!(vi, new_total_len)
