@@ -10,14 +10,30 @@ using Pkg
 Pkg.activate(@__DIR__)
 let
     parent_pkg = abspath(joinpath(@__DIR__, ".."))
-    cxsparse_pkg = abspath(joinpath(@__DIR__, "..", "..", "CXSparse.jl"))
-    try
-        Pkg.develop(path=parent_pkg)
-    catch
+    cxsparse_candidates = [
+        abspath(joinpath(@__DIR__, "..", "..", "CXSparse.jl")),
+        abspath(joinpath(@__DIR__, "..", "..", "..", "..", "..", "CXSparse.jl")),
+        abspath(joinpath(@__DIR__, "..", "..", "..", "..", "..", "..", "CXSparse.jl")),
+    ]
+    # Dev-load the parent package first so resolution sees it as a path source.
+    Pkg.develop(path=parent_pkg)
+    cxsparse_found = false
+    for cx in cxsparse_candidates
+        if isdir(cx)
+            try
+                Pkg.develop(path=cx)
+                cxsparse_found = true
+            catch e
+                @warn "Failed to dev CXSparse at $cx" exception=e
+            end
+            break
+        end
     end
-    if isdir(cxsparse_pkg)
+    if !cxsparse_found
+        # Drop CXSparse from the Project.toml so resolution can proceed
+        # without it (e.g. when CXSparse.jl isn't checked out alongside).
         try
-            Pkg.develop(path=cxsparse_pkg)
+            Pkg.rm("CXSparse")
         catch
         end
     end
@@ -106,6 +122,18 @@ for f in files
     res = all(isfinite, x) ? norm(A*x - b) : NaN
     nn = count(!isfinite, x)
     fmt_row(short, "CSR-QR refactor! (amd)", minimum(t.times)/1000, res, nn)
+
+    # 3c) SparseColumnPivotedQR — adaptive dense fallback on top of AMD.
+    # Probes whether materializing the late-fill block + LAPACK geqp3 is
+    # cheaper than continuing in sparse Householder land.
+    sym_amd_ad = csr_analyze(Acsr; ordering=:amd)
+    F0_ad = csr_factor(Acsr, sym_amd_ad; adaptive_dense=true); x = F0_ad \ b
+    t = @benchmark begin
+        F2 = csr_refactor!($F0_ad, $Acsr; adaptive_dense=true); $x .= F2 \ $b
+    end seconds=1
+    res = all(isfinite, x) ? norm(A*x - b) : NaN
+    nn = count(!isfinite, x)
+    fmt_row(short, "CSR-QR refactor! (amd+ad)", minimum(t.times)/1000, res, nn)
 
     # 4) SuiteSparseQR (SPQR) via qr(::SparseMatrixCSC)
     Fs = qr(A); xs = Fs \ b
