@@ -296,6 +296,30 @@ end
         @test norm(Q * R_ext - PAq) < 1e-10
     end
 
+    @testset "Symbolic exact R column counts" begin
+        # The `rcount` field of CSRQRSymbolic should equal the per-column nnz
+        # of the produced R factor (exact under no-cancellation).
+        Random.seed!(20)
+        for (m, n, p) in [(20, 15, 0.3), (30, 20, 0.2), (50, 50, 0.15)]
+            A = sprand(m, n, p) + sparse(I, m, n)
+            Acsr = build_csr(Matrix(A))
+            for ordering in (:natural, :amd)
+                sym = csr_analyze(Acsr; ordering=ordering)
+                F = csr_factor(Acsr, sym)
+                actual = [F.R_colptr[k + 1] - F.R_colptr[k] for k in 1:n]
+                # rcount stored on the symbolic returned by analyze (not the
+                # potentially-repivoted one inside F.sym) should match the
+                # uncorrected column counts.
+                @test sym.rcount == actual
+                # The factor's symbolic (which may have been repivoted) should
+                # at minimum satisfy sum(rcount) == sum(actual).
+                @test sum(F.sym.rcount) == sum(actual)
+                @test F.sym.rnz == sum(actual)
+                @test length(F.R_nzval) == sum(actual)
+            end
+        end
+    end
+
     @testset "Numerically-zero column triggers value-aware repivot" begin
         # A is 6x6 full rank except column 4 which is numerically zero.
         Random.seed!(16)

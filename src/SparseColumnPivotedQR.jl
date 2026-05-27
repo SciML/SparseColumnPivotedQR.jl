@@ -77,6 +77,7 @@ struct CSRQRSymbolic
     leftmost::Vector{Int}
     vnz::Int
     rnz::Int
+    rcount::Vector{Int}     # exact nnz per column of R (length n)
     ordering::Symbol
     pattern_rowptr::Vector{Int}
     pattern_colval::Vector{Int}
@@ -200,6 +201,67 @@ function _pattern_matches(S::CSRQRSymbolic, A::SparseMatrixCSR{Bi}) where {Bi}
         Int(A.colval[i]) + off == S.pattern_colval[i] || return false
     end
     return true
+end
+
+# ---------------------------------------------------------------------------
+# Exact R column counts via an ereach-based symbolic pass.
+# ---------------------------------------------------------------------------
+
+# cs_counts: exact column counts of the upper-triangular factor R for the
+# QR factorization of A. Inputs are the column-permuted matrix S = A(:,q)
+# pattern in CSC form, plus its column etree and a postorder.
+#
+# Returns Vector{Int} of length n with the exact nnz of each column of R
+# (including the diagonal entry R[k,k]). Equivalently this is the number
+# of structural nonzeros in R[:, k] (the upper-triangular column k of R)
+# under the no-cancellation assumption.
+#
+# Implementation: this is a symbolic-only pass that mirrors the ereach
+# walk used in the numeric kernel. For each column k:
+#
+#   1. Initialize the column-k row set R[:,k] to the rows of S[:,k] that
+#      lie in {1..k}. Mark each such row as "in pattern".
+#   2. For each row i in S[:,k] with leftmost[i] = lm <= k, traverse up the
+#      etree from lm following `parent[]`, adding each visited node < k to
+#      the pattern (deduplicated via a stamp array).
+#   3. The diagonal entry R[k,k] is always present (added explicitly).
+#
+# Time complexity: O(nnz(R)) per call, dominated by the etree walks. This
+# is the same complexity as the numeric phase's ereach work, run once.
+#
+# Note: this is an "ereach-based" exact count (used by Davis cs_qr to
+# pre-size the numeric buffers). It is exact under the no-cancellation
+# assumption. We keep the name cs_counts for familiarity with CSparse, but
+# the algorithm here is the ereach formulation rather than the Gilbert-Ng-
+# Peyton union-find one (which is O(nnz·α) but more intricate for QR).
+# For the matrix sizes typical in this package (n ~ 200, nnz ~ 1000), the
+# ereach formulation is both simpler and competitive.
+function _cs_counts(colptr::Vector{Int}, rowval::Vector{Int},
+                    parent::Vector{Int}, leftmost::Vector{Int},
+                    m::Int, n::Int)
+    colcount = zeros(Int, n)
+    stamp = zeros(Int, n)         # stamp[j] == k means j is in column-k pattern
+    @inbounds for k in 1:n
+        cnt = 0
+        c1 = colptr[k]; c2 = colptr[k + 1] - 1
+        for p in c1:c2
+            i = rowval[p]
+            lm = leftmost[i]
+            if lm == 0 || lm > k
+                continue
+            end
+            # Walk up etree from lm until we hit a node >= k or already-stamped.
+            jj = lm
+            while jj != 0 && jj < k && stamp[jj] != k
+                stamp[jj] = k
+                cnt += 1
+                jj = parent[jj]
+            end
+        end
+        # Diagonal R[k,k].
+        colcount[k] = cnt + 1
+    end
+    return colcount
 end
 
 # ---------------------------------------------------------------------------
@@ -421,43 +483,30 @@ function _build_symbolic(rowptr::Vector{Int}, colval::Vector{Int},
         end
     end
 
-    # 8) Compute exact / upper-bound vnz, rnz.
-    vnz, rnz = _vnz_rnz_estimate(colptr_q, rowval_q, parent,
-                                  leftmost_orig, m, n)
-
-    # Return original-row leftmost too? No; we only need the permuted one
-    # during the numeric phase. We return the permuted one.
-    return q, pinv, parent, leftmost_perm, m2, vnz, rnz
+    # 8) Compute exact R column counts via the ereach-based cs_counts. The
+    # exact rnz is sum(rcount). V's exact column count is bounded by the
+    # same row-extent bound used previously; computing the V exact count
+    # would require a second pass and gives only marginal savings here.
+    rcount = _cs_counts(colptr_q, rowval_q, parent, leftmost_orig, m, n)
+    rnz_exact = 0
+    @inbounds for k in 1:n
+        rnz_exact += rcount[k]
+    end
+    vnz_bound = _vnz_estimate(leftmost_orig, m, n)
+    return q, pinv, parent, leftmost_perm, m2, vnz_bound, rnz_exact, rcount
 end
 
-# Upper-bound estimate of nnz(V) and nnz(R), used to pre-size CSC buffers.
-# Tightens iteratively if exceeded by `_grow_csc!`.
-function _vnz_rnz_estimate(colptr::Vector{Int}, rowval::Vector{Int},
-                            parent::Vector{Int},
-                            leftmost_orig::Vector{Int},
-                            m::Int, n::Int)
-    # rnz: for each column k of S, run ereach to count R[:,k] pattern entries
-    # (excluding diagonal). We use a *cheap* upper-bound: for each column k,
-    # the number of R entries is at most k itself (full upper triangle), but
-    # a tighter and cheaper bound uses the etree depth from the row reach.
-    # Compute a conservative bound via per-row contribution: each row i in
-    # the original matrix contributes (n - leftmost[i] + 1) entries summed
-    # across all R columns it touches. This overcounts but is O(m) instead
-    # of O(n * mean_pattern_size).
-    # vnz: bounded by sum over real rows of (n - leftmost[i] + 1).
+# Cheap O(m) upper bound for nnz(V): each real row contributes
+# (n - leftmost[i] + 1) to the V workspace size, with a small headroom.
+function _vnz_estimate(leftmost_orig::Vector{Int}, m::Int, n::Int)
     vnz = 0
-    rnz_bound = 0
     @inbounds for i in 1:m
         lm = leftmost_orig[i]
         if lm != 0
-            extent = n - lm + 1
-            vnz += extent
-            rnz_bound += extent
+            vnz += n - lm + 1
         end
     end
-    vnz = vnz + max(16, vnz >> 4)
-    rnz = min(rnz_bound, n * (n + 1) ÷ 2) + max(16, rnz_bound >> 4)
-    return vnz, rnz
+    return vnz + max(16, vnz >> 4)
 end
 
 # ---------------------------------------------------------------------------
@@ -483,10 +532,10 @@ Returns a `CSRQRSymbolic` that can be passed to `csr_factor` and reused via
 function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:natural) where {Bi}
     m, n = size(A)
     rowptr, colval = _capture_pattern(A)
-    q, pinv, parent, leftmost_perm, m2, vnz, rnz =
+    q, pinv, parent, leftmost_perm, m2, vnz, rnz, rcount =
         _build_symbolic(rowptr, colval, m, n, ordering)
     return CSRQRSymbolic(m, n, m2, q, pinv, parent, leftmost_perm,
-                          vnz, rnz, ordering, rowptr, colval)
+                          vnz, rnz, rcount, ordering, rowptr, colval)
 end
 
 """
@@ -664,11 +713,11 @@ function _maybe_repivot_zero_cols_from_norms(col_norms::Vector{RT},
     end
 
     # Rebuild symbolic with the new q'.
-    q2, pinv2, parent2, leftmost2, m2_2, vnz2, rnz2 =
+    q2, pinv2, parent2, leftmost2, m2_2, vnz2, rnz2, rcount2 =
         _rebuild_symbolic_for_q(sym.pattern_rowptr, sym.pattern_colval,
                                  sym.m, sym.n, q_new)
     return CSRQRSymbolic(sym.m, sym.n, m2_2, q2, pinv2, parent2, leftmost2,
-                         vnz2, rnz2, sym.ordering, sym.pattern_rowptr,
+                         vnz2, rnz2, rcount2, sym.ordering, sym.pattern_rowptr,
                          sym.pattern_colval)
 end
 
@@ -759,9 +808,13 @@ function _rebuild_symbolic_for_q(rowptr::Vector{Int}, colval::Vector{Int},
         end
     end
 
-    vnz, rnz = _vnz_rnz_estimate(colptr_q, rowval_q, parent, leftmost_orig,
-                                  m, n)
-    return q, pinv, parent, leftmost_perm, m2, vnz, rnz
+    rcount = _cs_counts(colptr_q, rowval_q, parent, leftmost_orig, m, n)
+    rnz = 0
+    @inbounds for k in 1:n
+        rnz += rcount[k]
+    end
+    vnz = _vnz_estimate(leftmost_orig, m, n)
+    return q, pinv, parent, leftmost_perm, m2, vnz, rnz, rcount
 end
 
 # Numeric loop. Returns a CSRQRFactorization.
