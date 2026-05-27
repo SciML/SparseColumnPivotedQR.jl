@@ -8,11 +8,9 @@
 
 using Pkg
 Pkg.activate(@__DIR__)
-# Set up sibling devs / required adds.
 let
     parent_pkg = abspath(joinpath(@__DIR__, ".."))
     cxsparse_pkg = abspath(joinpath(@__DIR__, "..", "..", "CXSparse.jl"))
-    # SparseColumnPivotedQR itself
     try
         Pkg.develop(path=parent_pkg)
     catch
@@ -23,11 +21,12 @@ let
         catch
         end
     end
-    Pkg.add(["BenchmarkTools", "SparseMatricesCSR"])
+    Pkg.add(["AMD", "BenchmarkTools", "SparseMatricesCSR"])
 end
 
 using LinearAlgebra, SparseArrays, SparseMatricesCSR, BenchmarkTools, Printf
 using SparseColumnPivotedQR
+using AMD  # trigger AMD extension
 
 cxsparse_ok = try
     @eval using CXSparse
@@ -41,14 +40,14 @@ files = isdir(UPLOADS) ? sort(readdir(UPLOADS; join=true)) : String[]
 
 function load_case(f)
     text = read(f, String)
-    lines = split(text, '\n'; keepempty=false)
+    lines = split(text, "\n"; keepempty=false)
     A = eval(Meta.parse(strip(lines[1])))
     b = eval(Meta.parse(strip(lines[2])))
     return A, b
 end
 
 function fmt_row(file, solver, t_us, res, nn)
-    @printf("%-30s %-16s %10s   %12s   %6d\n",
+    @printf("%-30s %-22s %10s   %12s   %6d\n",
             file, solver,
             isnan(t_us) ? "-" : @sprintf("%9.1f", t_us),
             isnan(res) ? "NaN" : @sprintf("%.3e", res),
@@ -56,11 +55,11 @@ function fmt_row(file, solver, t_us, res, nn)
 end
 
 println()
-println("=" ^ 88)
+println("=" ^ 95)
 println("Benchmarks on user matrices (199x199, nnz≈979); minimum time of @benchmark seconds=1")
-println("=" ^ 88)
-@printf("%-30s %-16s %10s   %12s   %6s\n", "file", "solver", "time (μs)", "||Ax-b||", "nnan(x)")
-println("-" ^ 88)
+println("=" ^ 95)
+@printf("%-30s %-22s %10s   %12s   %6s\n", "file", "solver", "time (μs)", "||Ax-b||", "nnan(x)")
+println("-" ^ 95)
 
 for f in files
     A, b = load_case(f)
@@ -68,16 +67,35 @@ for f in files
     Adense = Matrix(A)
     short = first(basename(f), 28)
 
-    # 1) SparseColumnPivotedQR (CSR)
-    F = csr_qr(Acsr); x = F \ b
+    # 1) SparseColumnPivotedQR — natural ordering, one-shot csr_qr
+    F = csr_qr(Acsr; ordering=:natural); x = F \ b
     t = @benchmark begin
-        F2 = csr_qr($Acsr); $x .= F2 \ $b
+        F2 = csr_qr($Acsr; ordering=:natural); $x .= F2 \ $b
     end seconds=1
     res = all(isfinite, x) ? norm(A*x - b) : NaN
     nn = count(!isfinite, x)
-    fmt_row(short, "CSR-QR (this)", minimum(t.times)/1000, res, nn)
+    fmt_row(short, "CSR-QR natural", minimum(t.times)/1000, res, nn)
 
-    # 2) SuiteSparseQR (SPQR) via qr(::SparseMatrixCSC)
+    # 2) SparseColumnPivotedQR — AMD ordering, one-shot csr_qr
+    F = csr_qr(Acsr; ordering=:amd); x = F \ b
+    t = @benchmark begin
+        F2 = csr_qr($Acsr; ordering=:amd); $x .= F2 \ $b
+    end seconds=1
+    res = all(isfinite, x) ? norm(A*x - b) : NaN
+    nn = count(!isfinite, x)
+    fmt_row(short, "CSR-QR amd", minimum(t.times)/1000, res, nn)
+
+    # 3) SparseColumnPivotedQR — refactor! reusing natural symbolic
+    sym = csr_analyze(Acsr; ordering=:natural)
+    F0 = csr_factor(Acsr, sym); x = F0 \ b
+    t = @benchmark begin
+        F2 = csr_refactor!($F0, $Acsr); $x .= F2 \ $b
+    end seconds=1
+    res = all(isfinite, x) ? norm(A*x - b) : NaN
+    nn = count(!isfinite, x)
+    fmt_row(short, "CSR-QR refactor!", minimum(t.times)/1000, res, nn)
+
+    # 4) SuiteSparseQR (SPQR) via qr(::SparseMatrixCSC)
     Fs = qr(A); xs = Fs \ b
     t = @benchmark begin
         F2 = qr($A); $xs .= F2 \ $b
@@ -86,7 +104,7 @@ for f in files
     nn = count(!isfinite, xs)
     fmt_row(short, "SPQR", minimum(t.times)/1000, res, nn)
 
-    # 3) CXSparse cs_qr (if available)
+    # 5) CXSparse cs_qr (if available)
     if cxsparse_ok
         try
             Fcx = CXSparse.cs_qr(A); xcx = Fcx \ b
@@ -101,7 +119,7 @@ for f in files
         end
     end
 
-    # 4) Dense LAPACK column-pivoted QR
+    # 6) Dense LAPACK column-pivoted QR
     Fd = qr(Adense, ColumnNorm()); xd = Fd \ b
     t = @benchmark begin
         F2 = qr($Adense, ColumnNorm()); $xd .= F2 \ $b
