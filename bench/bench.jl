@@ -35,8 +35,15 @@ catch
     false
 end
 
+const BUNDLED = abspath(joinpath(@__DIR__, "..", "test", "matrices"))
 const UPLOADS = "/home/crackauc/.claude/uploads/d279ff12-71e6-4faf-b1ac-6715899a256b"
-files = isdir(UPLOADS) ? sort(readdir(UPLOADS; join=true)) : String[]
+files = if isdir(BUNDLED)
+    sort(filter(f -> endswith(f, ".txt"), readdir(BUNDLED; join=true)))
+elseif isdir(UPLOADS)
+    sort(readdir(UPLOADS; join=true))
+else
+    String[]
+end
 
 function load_case(f)
     text = read(f, String)
