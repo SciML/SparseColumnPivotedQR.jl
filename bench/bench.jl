@@ -93,7 +93,19 @@ for f in files
     end seconds=1
     res = all(isfinite, x) ? norm(A*x - b) : NaN
     nn = count(!isfinite, x)
-    fmt_row(short, "CSR-QR refactor!", minimum(t.times)/1000, res, nn)
+    fmt_row(short, "CSR-QR refactor! (nat)", minimum(t.times)/1000, res, nn)
+
+    # 3b) SparseColumnPivotedQR — refactor! reusing AMD symbolic. This is
+    # the apples-to-apples comparison to CXSparse cs_qr: AMD ordering up front
+    # and only the numeric phase running per solve call.
+    sym_amd = csr_analyze(Acsr; ordering=:amd)
+    F0_amd = csr_factor(Acsr, sym_amd); x = F0_amd \ b
+    t = @benchmark begin
+        F2 = csr_refactor!($F0_amd, $Acsr); $x .= F2 \ $b
+    end seconds=1
+    res = all(isfinite, x) ? norm(A*x - b) : NaN
+    nn = count(!isfinite, x)
+    fmt_row(short, "CSR-QR refactor! (amd)", minimum(t.times)/1000, res, nn)
 
     # 4) SuiteSparseQR (SPQR) via qr(::SparseMatrixCSC)
     Fs = qr(A); xs = Fs \ b
