@@ -36,7 +36,9 @@ mutable struct _CSCBuf{T}
 end
 
 @inline function _alloc_csc(::Type{T}, m::Int, n::Int, nzmax::Int) where {T}
-    return _CSCBuf{T}(m, n, zeros(Int, n + 1),
+    # colptr left uninitialized; the caller sets colptr[1] = 1 and writes
+    # colptr[k+1] at the end of each step.
+    return _CSCBuf{T}(m, n, Vector{Int}(undef, n + 1),
                       Vector{Int}(undef, max(nzmax, 1)),
                       Vector{T}(undef, max(nzmax, 1)))
 end
@@ -777,13 +779,14 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
 
     V = _alloc_csc(T, m2, n, sym.vnz)
     R = _alloc_csc(T, n, n, sym.rnz)
-    beta = zeros(RT, n)
+    beta = Vector{RT}(undef, n)
 
-    # Workspaces.
+    # Workspaces. `x` and `w` must be zero-initialised (`x` is the dense
+    # scatter slot, `w` is the ereach marker compared against k >= 1).
     x = zeros(T, m2)
-    s = zeros(Int, n)
-    w = zeros(Int, n)        # ereach marker by column (mark = k each step)
-    vrows = zeros(Int, m2)   # V[:,k]'s row list, built at emit time
+    s = Vector{Int}(undef, n)
+    w = zeros(Int, n)
+    vrows = Vector{Int}(undef, m2)
 
     V.colptr[1] = 1
     R.colptr[1] = 1
