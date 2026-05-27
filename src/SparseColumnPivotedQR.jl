@@ -837,7 +837,9 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
                 continue
             end
             vc1 = V.colptr[p_idx]; vc2 = V.colptr[p_idx + 1] - 1
-            # Bring V[:,p_idx]'s rows into V[:,k]'s pattern (they may now have x).
+            bk = beta[p_idx]
+            # Combined pass: compute tau and mark new rows in vrows pattern.
+            tau = zero(T)
             for vp in vc1:vc2
                 ri = V.rowval[vp]
                 if rowmark[ri] != k
@@ -845,18 +847,12 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
                     vlen += 1
                     vrows[vlen] = ri
                 end
+                tau += conj(V.nzval[vp]) * x[ri]
             end
-            bk = beta[p_idx]
-            if vc2 >= vc1 && bk != 0
-                tau = zero(T)
+            if bk != 0 && tau != 0
+                tau_b = T(bk) * tau
                 for vp in vc1:vc2
-                    tau += conj(V.nzval[vp]) * x[V.rowval[vp]]
-                end
-                if tau != 0
-                    tau_b = T(bk) * tau
-                    for vp in vc1:vc2
-                        x[V.rowval[vp]] -= tau_b * V.nzval[vp]
-                    end
+                    x[V.rowval[vp]] -= tau_b * V.nzval[vp]
                 end
             end
             # Emit R[p_idx, k] = x[p_idx]; clear x[p_idx].
@@ -966,7 +962,10 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
         R.colptr[k + 1] = rnz_total + 1
 
         # Emit V[:,k]: first slot is row k with value v1; remaining slots are
-        # vrows[2..vlen] with values x[vrows[q]].
+        # vrows[2..vlen] with NONZERO values x[vrows[q]] only.
+        # Skipping exact zeros keeps V columns numerically sparse: rows marked
+        # by the apply-step row-tracking but cancelled to 0 by Householder
+        # arithmetic don't pollute future apply walks.
         if vnz_total + vlen > length(V.rowval)
             _grow_csc!(V, vnz_total + vlen)
         end
@@ -974,9 +973,12 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
         V.rowval[vnz_total] = k
         V.nzval[vnz_total] = v1
         for q in 2:vlen
-            vnz_total += 1
-            V.rowval[vnz_total] = vrows[q]
-            V.nzval[vnz_total] = x[vrows[q]]
+            xv = x[vrows[q]]
+            if xv != zero(T)
+                vnz_total += 1
+                V.rowval[vnz_total] = vrows[q]
+                V.nzval[vnz_total] = xv
+            end
         end
         V.colptr[k + 1] = vnz_total + 1
 
