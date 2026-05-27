@@ -10,61 +10,95 @@ import Base: \, size, eltype
 export csr_qr, csr_analyze, csr_factor, csr_refactor!,
        CSRQRSymbolic, CSRQRFactorization
 
-# SparseMatricesCSR offset: rowptr stores 1-based if Bi == 1, 0-based if Bi == 0.
+# CSR offset: rowptr stores 1-based if Bi == 1, 0-based if Bi == 0.
 @inline function getoffset(::SparseMatrixCSR{Bi}) where {Bi}
     return Bi == 1 ? 0 : 1
+end
+
+# ---------------------------------------------------------------------------
+# CSC-internal layout for V and R during numeric phase.
+# ---------------------------------------------------------------------------
+#
+# Both V (Householder vectors) and R (upper-triangular factor) are kept in
+# compressed-column form: colptr (length n+1), rowval and nzval (length =
+# total nnz). Column k of V is rowval[colptr[k]:colptr[k+1]-1] and same for
+# nzval. Same for R.
+#
+# Pre-sized exactly from the symbolic phase (subject to per-step growth if
+# the conservative bound was undershot — handled by `_grow_csc!`).
+
+mutable struct _CSCBuf{T}
+    m::Int
+    n::Int
+    colptr::Vector{Int}
+    rowval::Vector{Int}
+    nzval::Vector{T}
+end
+
+@inline function _alloc_csc(::Type{T}, m::Int, n::Int, nzmax::Int) where {T}
+    return _CSCBuf{T}(m, n, zeros(Int, n + 1),
+                      Vector{Int}(undef, max(nzmax, 1)),
+                      Vector{T}(undef, max(nzmax, 1)))
+end
+
+@inline function _grow_csc!(B::_CSCBuf{T}, needed::Int) where {T}
+    L = length(B.rowval)
+    new_L = max(2 * L, needed)
+    resize!(B.rowval, new_L)
+    resize!(B.nzval, new_L)
+    return nothing
 end
 
 # ---------------------------------------------------------------------------
 # Symbolic
 # ---------------------------------------------------------------------------
 #
-# The Symbolic carries the pieces of work that depend only on the *sparsity
-# pattern* of A: the column ordering used as the starting pivot order, an
-# elimination tree of A^T A, row counts of R, and per-row capacity hints.
-#
-# Column ordering choices:
-#   :natural — keep columns 1..n in input order (cheapest analyze).
-#   :amd     — AMD on A^T A (sparsity-preserving column order).
-#   :colamd  — currently same as :amd (AMD on A^T A); see the README.
-#
-# The numeric phase may deviate from this ordering when a candidate column
-# turns out to be rank-deficient (column-pivoting kicks in). In that case the
-# symbolic capacity hints become loose upper bounds rather than exact counts.
+# The `Symbolic` captures:
+#   - `q`         : column permutation (1-based, length n)
+#   - `pinv`      : row permutation (1-based, length m2; "S_row = pinv[A_row]")
+#   - `parent`    : column etree of S = (P A Q)
+#   - `leftmost`  : leftmost[i] = first column k where S[i, :] is nonzero
+#                   (indexed by permuted row 1..m2; 0 = empty row)
+#   - `vnz`/`rnz` : upper bounds on nnz(V), nnz(R) used to pre-size buffers
+#   - `m2`        : padded row count
+#   - `ordering`  : symbolic ordering kind (:natural / :amd / :colamd)
+#   - `pattern_*` : captured CSR pattern of the input (for refactor! pattern
+#                   matching). Stored 1-based, internal layout.
 
 struct CSRQRSymbolic
     m::Int
     n::Int
-    colperm::Vector{Int}        # initial column ordering (length n)
-    rowcap::Vector{Int}         # per-row capacity hint for R (length m)
-    ordering::Symbol            # :natural, :amd, :colamd
-    pattern_rowptr::Vector{Int} # captured pattern of input A (for refactor!)
+    m2::Int
+    q::Vector{Int}
+    pinv::Vector{Int}
+    parent::Vector{Int}
+    leftmost::Vector{Int}
+    vnz::Int
+    rnz::Int
+    ordering::Symbol
+    pattern_rowptr::Vector{Int}
     pattern_colval::Vector{Int}
 end
 
 Base.size(S::CSRQRSymbolic) = (S.m, S.n)
 
 # ---------------------------------------------------------------------------
-# Numeric factorization
+# Factorization
 # ---------------------------------------------------------------------------
 #
-# Storage layout:
-# - R is stored as a list of row-sparse vectors (R_cols[i], R_vals[i]), each kept
-#   sorted by column index.
-# - The k-th Householder vector v_k is stored "step-wise" as (Vstep_idx[k],
-#   Vstep_val[k]): the row indices where v_k is nonzero (sorted), and the
-#   corresponding values. This makes `applyQ` / `applyQH` O(sum nnz(v_k)).
-# - sym is the Symbolic that was used to produce this factorization.
+# CSC storage of V (Householders) and R, plus beta (Householder coefficients),
+# plus the symbolic. Permutations come from `sym`.
 
 struct CSRQRFactorization{T, RT}
     m::Int
     n::Int
-    R_cols::Vector{Vector{Int}}
-    R_vals::Vector{Vector{T}}
-    Vstep_idx::Vector{Vector{Int}}
-    Vstep_val::Vector{Vector{T}}
-    tau::Vector{T}
-    perm::Vector{Int}
+    V_colptr::Vector{Int}
+    V_rowval::Vector{Int}
+    V_nzval::Vector{T}
+    R_colptr::Vector{Int}
+    R_rowval::Vector{Int}
+    R_nzval::Vector{T}
+    beta::Vector{RT}
     rnk::Int
     tol::RT
     sym::CSRQRSymbolic
@@ -76,107 +110,67 @@ Base.size(F::CSRQRFactorization, d::Integer) = d == 1 ? F.m : (d == 2 ? F.n : 1)
 Base.eltype(::CSRQRFactorization{T}) where {T} = T
 
 # ---------------------------------------------------------------------------
-# Small helpers on sorted-(cols,vals) sparse rows
+# CSR <-> CSC conversion (pattern + values)
 # ---------------------------------------------------------------------------
 
-@inline function row_get(cols::Vector{Int}, vals::Vector{T}, c::Int) where {T}
-    idx = searchsortedfirst(cols, c)
-    if idx <= length(cols) && cols[idx] == c
-        return vals[idx]
-    end
-    return zero(T)
-end
-
-@inline function row_remove!(cols::Vector{Int}, vals::Vector{T}, c::Int) where {T}
-    idx = searchsortedfirst(cols, c)
-    if idx <= length(cols) && cols[idx] == c
-        deleteat!(cols, idx)
-        deleteat!(vals, idx)
-        return true
-    end
-    return false
-end
-
-@inline function row_set!(cols::Vector{Int}, vals::Vector{T}, c::Int, v::T) where {T}
-    idx = searchsortedfirst(cols, c)
-    if idx <= length(cols) && cols[idx] == c
-        vals[idx] = v
-    else
-        insert!(cols, idx, c)
-        insert!(vals, idx, v)
-    end
-    return nothing
-end
-
-# Convert a SparseMatrixCSR to a list of (cols, vals) row arrays (sorted by col).
-# Applies an optional column permutation: if colperm_inv[j] = new_col, then
-# input column j ends up as column colperm_inv[j] in the output rows.
-#
-# When `rowcap` is provided, allocate each row at the upper-bound capacity
-# directly (Vector{...}(undef, cap)) and shrink to the actual nnz via resize!.
-# This avoids a separate sizehint!() reallocation per row.
-function _csr_to_rows(A::SparseMatrixCSR{Bi, T},
-                     colperm_inv::Union{Nothing, Vector{Int}}=nothing,
-                     rowcap::Union{Nothing, Vector{Int}}=nothing) where {Bi, T}
+function _csr_to_csc(A::SparseMatrixCSR{Bi, T}) where {Bi, T}
     m, n = size(A)
-    cols = Vector{Vector{Int}}(undef, m)
-    vals = Vector{Vector{T}}(undef, m)
+    off = getoffset(A)
     rowptr = A.rowptr
     colval = A.colval
-    nzval = A.nzval
-    off = getoffset(A)
+    nzval_in = A.nzval
+    nnz_total = length(colval)
+
+    colcounts = zeros(Int, n)
+    @inbounds for p in 1:nnz_total
+        colcounts[Int(colval[p]) + off] += 1
+    end
+    colptr = Vector{Int}(undef, n + 1)
+    colptr[1] = 1
+    @inbounds for j in 1:n
+        colptr[j + 1] = colptr[j] + colcounts[j]
+    end
+    rowval = Vector{Int}(undef, nnz_total)
+    nzval = Vector{T}(undef, nnz_total)
+    work = copy(colptr)
     @inbounds for i in 1:m
         r1 = rowptr[i] + off
         r2 = rowptr[i + 1] + off - 1
-        nz = r2 - r1 + 1
-        cap = (rowcap === nothing) ? nz : max(rowcap[i], nz)
-        ci = Vector{Int}(undef, cap)
-        vi = Vector{T}(undef, cap)
-        k = 1
-        if colperm_inv === nothing
-            for p in r1:r2
-                ci[k] = Int(colval[p]) + off
-                vi[k] = nzval[p]
-                k += 1
-            end
-        else
-            for p in r1:r2
-                ci[k] = colperm_inv[Int(colval[p]) + off]
-                vi[k] = nzval[p]
-                k += 1
-            end
+        for p in r1:r2
+            j = Int(colval[p]) + off
+            slot = work[j]
+            rowval[slot] = i
+            nzval[slot] = nzval_in[p]
+            work[j] = slot + 1
         end
-        # Sort if needed. We sort only the first nz entries; the tail
-        # storage is unused (length stays at nz after the resize! below).
-        unsorted = false
-        for p in 2:nz
-            if ci[p - 1] > ci[p]
-                unsorted = true
-                break
-            end
-        end
-        if unsorted
-            # Sort the first nz entries (the tail beyond nz is undefined memory).
-            view_c = view(ci, 1:nz)
-            view_v = view(vi, 1:nz)
-            pp = sortperm(view_c)
-            ci_sorted = view_c[pp]
-            vi_sorted = view_v[pp]
-            copyto!(view_c, ci_sorted)
-            copyto!(view_v, vi_sorted)
-        end
-        # Logical length = nz (the rest of `cap` is reserved capacity).
-        resize!(ci, nz)
-        resize!(vi, nz)
-        cols[i] = ci
-        vals[i] = vi
     end
-    return cols, vals
+    return colptr, rowval, nzval, m, n
 end
 
-# ---------------------------------------------------------------------------
-# Pattern capture (for refactor!)
-# ---------------------------------------------------------------------------
+function _csr_pattern_to_csc(rowptr::Vector{Int}, colval::Vector{Int},
+                             m::Int, n::Int)
+    nnz_total = length(colval)
+    colcounts = zeros(Int, n)
+    @inbounds for p in 1:nnz_total
+        colcounts[colval[p]] += 1
+    end
+    colptr = Vector{Int}(undef, n + 1)
+    colptr[1] = 1
+    @inbounds for j in 1:n
+        colptr[j + 1] = colptr[j] + colcounts[j]
+    end
+    rowval = Vector{Int}(undef, nnz_total)
+    work = copy(colptr)
+    @inbounds for i in 1:m
+        r1 = rowptr[i]; r2 = rowptr[i + 1] - 1
+        for p in r1:r2
+            j = colval[p]
+            rowval[work[j]] = i
+            work[j] += 1
+        end
+    end
+    return colptr, rowval
+end
 
 function _capture_pattern(A::SparseMatrixCSR{Bi}) where {Bi}
     off = getoffset(A)
@@ -207,93 +201,17 @@ function _pattern_matches(S::CSRQRSymbolic, A::SparseMatrixCSR{Bi}) where {Bi}
 end
 
 # ---------------------------------------------------------------------------
-# csr_analyze: build a Symbolic from A
+# Column elimination tree of S = A(:, q) using Davis cs_etree with ata=1.
 # ---------------------------------------------------------------------------
 
-"""
-    csr_analyze(A::SparseMatrixCSR; ordering=:natural) -> CSRQRSymbolic
-
-Symbolic analysis phase. Captures the sparsity pattern of `A`, computes an
-initial column ordering, and (where applicable) per-row capacity hints for
-`R`. The returned `CSRQRSymbolic` can be reused for repeated factorizations
-of matrices with identical sparsity patterns via `csr_refactor!`.
-
-`ordering` controls the initial column permutation handed to the numeric
-phase. Supported values:
-
-  * `:natural` — identity ordering, columns kept in input order.
-  * `:amd`     — AMD ordering of `AᵀA` (requires `AMD.jl` to be loaded; the
-                  package extension wires this up automatically). Falls back
-                  to `:natural` if AMD is unavailable.
-  * `:colamd`  — alias for `:amd` for now (true COLAMD is not yet
-                  implemented; AMD on `AᵀA` is a reasonable substitute).
-
-The numeric phase (`csr_factor`) is permitted to deviate from this initial
-ordering when a candidate column is rank-deficient (rank-revealing pivot).
-"""
-function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:natural) where {Bi}
-    m, n = size(A)
-    rowptr, colval = _capture_pattern(A)
-
-    colperm, rowcap = _analyze_pattern(rowptr, colval, m, n, ordering)
-
-    return CSRQRSymbolic(m, n, colperm, rowcap, ordering, rowptr, colval)
-end
-
-# This is the pure-symbolic kernel; it does not depend on T or on A's
-# Bi parameter. Extensions (AMD.jl) hook in by overriding _amd_colperm.
-function _analyze_pattern(rowptr::Vector{Int}, colval::Vector{Int},
-                          m::Int, n::Int, ordering::Symbol)
-    colperm = if ordering === :natural
-        collect(1:n)
-    elseif ordering === :amd || ordering === :colamd
-        _amd_colperm(rowptr, colval, m, n)
-    else
-        throw(ArgumentError("Unknown ordering :$ordering (expected :natural, :amd, or :colamd)"))
-    end
-
-    # Row capacity hints (upper bounds on nnz per row of R). For now we
-    # compute via the etree + row-count algorithm of Gilbert-Ng-Peyton,
-    # operating on A^T A implicitly. If the etree code is unavailable or the
-    # ordering deviates substantially during numeric pivoting, these are
-    # treated as hints (sizehint!) rather than fixed capacities.
-    rowcap = _row_capacity_hint(rowptr, colval, m, n, colperm)
-
-    return colperm, rowcap
-end
-
-# Default fallback: natural ordering. Overridden by the AMD.jl extension.
-_amd_colperm(rowptr, colval, m, n) = collect(1:n)
-
-# ---------------------------------------------------------------------------
-# Etree + row counts of R = qr(A) symbolic. Algorithm from Davis (CSparse),
-# adapted to operate on A given in CSR (rows of A). The column elimination
-# tree of A is the etree of A^T A; we never form A^T A explicitly.
-# ---------------------------------------------------------------------------
-
-# Column elimination tree of A (= etree of A^T A) using CSparse cs_etree
-# with ata=1. We iterate over columns of A, so we first bucket-sort the CSR
-# pattern into a CSC pattern. Returns parent[1:n] (0 = root) and the CSC
-# pattern, which we reuse later for row counts.
-#
-# CSparse semantics (1-based with 0 = "no parent"):
-#   parent[k]   = parent of k in the etree, or 0
-#   ancestor[k] = path-compression pointer used during construction
-#   prev[i]     = previous column of A that touched row i (for ata=1)
-#
-# For each column k of A and each nonzero (i, k), walk from prev[i] up
-# through ancestors; set ancestor on the way to k, and when we hit a node
-# with no ancestor yet, set parent = k.
-function _coletree_via_csc(rowptr::Vector{Int}, colval::Vector{Int}, m::Int, n::Int)
-    colptrc, rowidxc = _csr_pattern_to_csc(rowptr, colval, m, n)
+function _coletree_ata(colptr::Vector{Int}, rowval::Vector{Int}, m::Int, n::Int)
     parent = zeros(Int, n)
     ancestor = zeros(Int, n)
     prev = zeros(Int, m)
     @inbounds for k in 1:n
-        c1 = colptrc[k]
-        c2 = colptrc[k + 1] - 1
+        c1 = colptr[k]; c2 = colptr[k + 1] - 1
         for p in c1:c2
-            i = rowidxc[p]
+            i = rowval[p]
             ii = prev[i]
             while ii != 0 && ii < k
                 inext = ancestor[ii]
@@ -307,129 +225,312 @@ function _coletree_via_csc(rowptr::Vector{Int}, colval::Vector{Int}, m::Int, n::
             prev[i] = k
         end
     end
-    return parent, colptrc, rowidxc
+    return parent
 end
 
-# Convert CSR pattern -> CSC pattern (Bucketed). Returns colptr (length n+1), rowidx.
-function _csr_pattern_to_csc(rowptr::Vector{Int}, colval::Vector{Int}, m::Int, n::Int)
-    nnz_total = length(colval)
-    colcounts = zeros(Int, n)
-    @inbounds for p in 1:nnz_total
-        colcounts[colval[p]] += 1
+# Permute CSC pattern: output column k = input column q[k].
+function _permute_cols(colptr::Vector{Int}, rowval::Vector{Int},
+                       q::Vector{Int}, m::Int, n::Int)
+    nnz_total = length(rowval)
+    colptr_q = Vector{Int}(undef, n + 1)
+    colptr_q[1] = 1
+    @inbounds for k in 1:n
+        j = q[k]
+        colptr_q[k + 1] = colptr_q[k] + (colptr[j + 1] - colptr[j])
     end
-    colptr = Vector{Int}(undef, n + 1)
-    colptr[1] = 1
-    @inbounds for j in 1:n
-        colptr[j + 1] = colptr[j] + colcounts[j]
-    end
-    rowidx = Vector{Int}(undef, nnz_total)
-    work = copy(colptr)
-    @inbounds for i in 1:m
-        r1 = rowptr[i]; r2 = rowptr[i + 1] - 1
-        for p in r1:r2
-            j = colval[p]
-            rowidx[work[j]] = i
-            work[j] += 1
+    rowval_q = Vector{Int}(undef, nnz_total)
+    @inbounds for k in 1:n
+        j = q[k]
+        src = colptr[j]; n_in_col = colptr[j + 1] - colptr[j]
+        dst = colptr_q[k]
+        for t in 0:(n_in_col - 1)
+            rowval_q[dst + t] = rowval[src + t]
         end
     end
-    return colptr, rowidx
+    return colptr_q, rowval_q
 end
 
-# Row counts of R = qr(A) via the standard algorithm. Given the column etree
-# `parent` (etree of A^T A) and the CSC pattern, return rowcounts[1:n] such
-# that nnz(R[k, :]) <= rowcounts[k].
-#
-# For QR, a *symbolic* upper bound on row k of R is:
-#   |Rk| = | union over (k = anc of every i where A[i, :] has any column j with col-etree ancestor=k) |
-# A practical, slightly loose upper bound that is still sharper than "n - k + 1"
-# is to compute the column counts of L of A^T A (= row counts of R^T = R^T's columns)
-# which equals the row counts of R. The CSparse cs_counts gives this directly.
-#
-# We use a simpler upper bound: for each column k, the count is 1 (the diagonal)
-# + the number of columns j > k that descend from k in the etree along with the
-# nonzero pattern of A in column k. To keep this robust we just compute the
-# "reach" of each row of A and add to the row counts of all ancestors along
-# the etree path. This is O(nnz(R)) and matches the standard cs_counts result
-# upper bound used by CXSparse for symbolic QR.
-function _row_counts(rowptr::Vector{Int}, colval::Vector{Int},
-                     parent::Vector{Int}, colptrc::Vector{Int}, rowidxc::Vector{Int},
-                     m::Int, n::Int)
-    # We use a simple safe upper bound: for each row i of A, walk the columns
-    # j ∈ A[i, :]; the row count of R[j, :] gets +1 for each unique row i in
-    # the column j's reach. Concretely:
-    #   * Process rows i of A in order.
-    #   * For each i, find the columns reached (sorted). Each col j contributes
-    #     1 to rowcount[j].
-    # This double-counts when the same (j) is reached from multiple ancestors;
-    # to avoid that we use a "marker" array and ascend etree from each j until
-    # we hit a marked node.
-    rowcounts = zeros(Int, n)
-    mark = fill(0, n)
-    @inbounds for i in 1:m
-        r1 = rowptr[i]; r2 = rowptr[i + 1] - 1
-        # ascend from each j = colval[p..r2] up to common marked ancestor.
-        for p in r1:r2
-            j = colval[p]
-            jj = j
-            while jj != 0 && mark[jj] != i
-                rowcounts[jj] += 1
-                mark[jj] = i
-                jj = parent[jj]
+# Apply both perms (P A Q): output col k = (PA)[:, q[k]]. Row i becomes pinv[i].
+# Also permutes nzval if provided.
+function _permute_pq(colptr::Vector{Int}, rowval::Vector{Int},
+                     nzval::Union{Nothing, Vector{T}},
+                     pinv::Vector{Int}, q::Vector{Int},
+                     m::Int, n::Int) where {T}
+    nnz_total = length(rowval)
+    colptr_pq = Vector{Int}(undef, n + 1)
+    colptr_pq[1] = 1
+    @inbounds for k in 1:n
+        j = q[k]
+        colptr_pq[k + 1] = colptr_pq[k] + (colptr[j + 1] - colptr[j])
+    end
+    rowval_pq = Vector{Int}(undef, nnz_total)
+    if nzval === nothing
+        @inbounds for k in 1:n
+            j = q[k]
+            src = colptr[j]; n_in_col = colptr[j + 1] - colptr[j]
+            dst = colptr_pq[k]
+            for t in 0:(n_in_col - 1)
+                rowval_pq[dst + t] = pinv[rowval[src + t]]
+            end
+        end
+        return colptr_pq, rowval_pq, nothing
+    else
+        nzval_pq = Vector{T}(undef, nnz_total)
+        @inbounds for k in 1:n
+            j = q[k]
+            src = colptr[j]; n_in_col = colptr[j + 1] - colptr[j]
+            dst = colptr_pq[k]
+            for t in 0:(n_in_col - 1)
+                rowval_pq[dst + t] = pinv[rowval[src + t]]
+                nzval_pq[dst + t] = nzval[src + t]
+            end
+        end
+        return colptr_pq, rowval_pq, nzval_pq
+    end
+end
+
+# ---------------------------------------------------------------------------
+# Symbolic analysis: build q, pinv, etree, leftmost, vnz, rnz.
+# Implements Davis cs_sqr for QR with order = (passed in).
+# ---------------------------------------------------------------------------
+
+# Default no-op AMD hook; overridden by the AMD.jl extension.
+_amd_colperm(rowptr, colval, m, n) = collect(1:n)
+
+function _build_symbolic(rowptr::Vector{Int}, colval::Vector{Int},
+                          m::Int, n::Int, ordering::Symbol)
+    # 1) Column permutation `q`.
+    q = if ordering === :natural
+        collect(1:n)
+    elseif ordering === :amd || ordering === :colamd
+        _amd_colperm(rowptr, colval, m, n)
+    else
+        throw(ArgumentError("Unknown ordering :$ordering"))
+    end
+
+    # 2) Build CSC pattern of A.
+    colptr_A, rowval_A = _csr_pattern_to_csc(rowptr, colval, m, n)
+
+    # 3) Build CSC pattern of A(:, q).
+    colptr_q, rowval_q = _permute_cols(colptr_A, rowval_A, q, m, n)
+
+    # 4) Etree of A(:, q)^T A(:, q).
+    parent = _coletree_ata(colptr_q, rowval_q, m, n)
+
+    # 5) Compute leftmost[i] for each row i of A(:, q).
+    # leftmost (indexed by original row 1..m) = min col k where (A_q)[i,k] != 0.
+    leftmost_orig = zeros(Int, m)
+    @inbounds for k in 1:n
+        c1 = colptr_q[k]; c2 = colptr_q[k + 1] - 1
+        for p in c1:c2
+            i = rowval_q[p]
+            if leftmost_orig[i] == 0
+                leftmost_orig[i] = k
             end
         end
     end
-    # rowcounts[k] now upper-bounds nnz(R[k, :]). Add a small slack so that
-    # numeric column-pivot deviation doesn't blow past this hint.
-    return rowcounts
+
+    # 6) Build pinv (row permutation) so that rows are grouped by leftmost
+    # ascending. Each step k gets one row as the "diagonal"; if there are
+    # extra rows with the same leftmost they get trailing slots; if there
+    # are no rows with leftmost == k, we add a fictitious row at slot k.
+    head = fill(0, n + 1)
+    nxt = zeros(Int, m)
+    @inbounds for i in m:-1:1
+        if leftmost_orig[i] != 0
+            k = leftmost_orig[i]
+            nxt[i] = head[k]
+            head[k] = i
+        else
+            nxt[i] = head[n + 1]
+            head[n + 1] = i
+        end
+    end
+
+    # Two-pass slot assignment. First count m2.
+    # m2 = (# real rows) + (# slot positions k with empty bucket).
+    pinv = zeros(Int, m)
+    m2 = 0
+    @inbounds for k in 1:n
+        if head[k] == 0
+            m2 += 1            # fictitious row at slot k
+        else
+            # count rows in bucket
+            j = head[k]
+            while j != 0
+                m2 += 1
+                j = nxt[j]
+            end
+        end
+    end
+    # Plus empty rows (leftmost == 0) get trailing slots.
+    nempty = 0
+    @inbounds begin
+        ii = head[n + 1]
+        while ii != 0
+            nempty += 1
+            ii = nxt[ii]
+        end
+    end
+    m2 += nempty
+
+    # Second pass: assign pinv. Primary row in bucket k → slot k; extras go
+    # to slots n+1, n+2, .... Empty rows go after all of those.
+    nextslot = n + 1
+    @inbounds for k in 1:n
+        i = head[k]
+        if i != 0
+            pinv[i] = k
+            j = nxt[i]
+            while j != 0
+                pinv[j] = nextslot
+                nextslot += 1
+                j = nxt[j]
+            end
+        end
+    end
+    # Empty rows trailing.
+    @inbounds begin
+        ii = head[n + 1]
+        while ii != 0
+            pinv[ii] = nextslot
+            nextslot += 1
+            ii = nxt[ii]
+        end
+    end
+
+    # 7) Build leftmost in *permuted* row space (indexed by 1..m2).
+    # leftmost_perm[pinv[i]] = leftmost_orig[i] for real rows; fictitious
+    # rows get leftmost = their slot k (i.e. they "become live" at exactly k).
+    leftmost_perm = zeros(Int, m2)
+    @inbounds for i in 1:m
+        leftmost_perm[pinv[i]] = leftmost_orig[i]
+    end
+    # Fictitious rows: their slot k has no real row mapped to it, so
+    # leftmost_perm[k] is still 0. But for the numeric phase to behave
+    # correctly we should set leftmost_perm[slot] = slot itself (so the
+    # row "becomes live" exactly at its own step k). For slots that fall
+    # outside 1..n (trailing slots from empty rows), leftmost = slot itself
+    # works fine too (they'll never be in any column's pattern since they
+    # have no nonzeros).
+    @inbounds for slot in 1:m2
+        if leftmost_perm[slot] == 0
+            leftmost_perm[slot] = slot <= n ? slot : 0
+        end
+    end
+
+    # 8) Compute exact / upper-bound vnz, rnz.
+    vnz, rnz = _vnz_rnz_estimate(colptr_q, rowval_q, parent,
+                                  leftmost_orig, m, n)
+
+    # Return original-row leftmost too? No; we only need the permuted one
+    # during the numeric phase. We return the permuted one.
+    return q, pinv, parent, leftmost_perm, m2, vnz, rnz
 end
 
-# Compute per-row capacity hint. Mapped under the column permutation.
-function _row_capacity_hint(rowptr::Vector{Int}, colval::Vector{Int},
-                            m::Int, n::Int, colperm::Vector{Int})
-    # Permute pattern columns first.
-    if colperm == 1:n || (length(colperm) == n && all(colperm[i] == i for i in 1:n))
-        colval_p = colval
-        rowptr_p = rowptr
-    else
-        invperm = zeros(Int, n)
-        @inbounds for k in 1:n
-            invperm[colperm[k]] = k
+# Upper-bound estimate of nnz(V) and nnz(R), used to pre-size CSC buffers.
+# Tightens iteratively if exceeded by `_grow_csc!`.
+function _vnz_rnz_estimate(colptr::Vector{Int}, rowval::Vector{Int},
+                            parent::Vector{Int},
+                            leftmost_orig::Vector{Int},
+                            m::Int, n::Int)
+    # rnz: for each column k of S, run ereach to count R[:,k] pattern entries
+    # (excluding diagonal). Each ereach walk is amortized O(|R[:,k]|).
+    s = zeros(Int, n)
+    w = zeros(Int, n)
+    rnz = 0
+    @inbounds for k in 1:n
+        c1 = colptr[k]; c2 = colptr[k + 1] - 1
+        top = n + 1
+        for p in c1:c2
+            i = rowval[p]
+            lm = leftmost_orig[i]
+            if lm > 0 && lm <= k
+                len = 0
+                jj = lm
+                while jj != 0 && w[jj] != k && jj < k
+                    s[len + 1] = jj
+                    len += 1
+                    w[jj] = k
+                    jj = parent[jj]
+                end
+                # Transfer s[1..len] (deepest-first walk order) into
+                # s[top-len..top-1] in *increasing-column-index* order so that
+                # the apply loop iterates s[top..n] from smallest to largest k.
+                # Davis cs_ereach does this with `while(len>0) s[--top]=s[--len]`
+                # which moves s[len] -> s[top-1], etc. The result: smallest
+                # index ends up at the lowest output slot.
+                while len > 0
+                    top -= 1
+                    s[top] = s[len]
+                    len -= 1
+                end
+            end
         end
-        colval_p = Vector{Int}(undef, length(colval))
-        @inbounds for p in eachindex(colval)
-            colval_p[p] = invperm[colval[p]]
+        rnz += (n + 1 - top)  # includes diag (will recount: actually diag
+                              # is always in the pattern since we walk from
+                              # leftmost <= k up to k itself).
+    end
+    # Add +n for the diagonals (in case ereach didn't include them — it does
+    # if and only if leftmost[i] reaches k from some row i in the column).
+    # Conservative slack:
+    rnz += n
+    rnz = rnz + max(16, rnz >> 4)
+
+    # vnz: bounded by sum over real rows of (n - leftmost[i] + 1). For
+    # m << n this is generous; for dense-fill cases this is fine.
+    vnz = 0
+    @inbounds for i in 1:m
+        lm = leftmost_orig[i]
+        if lm != 0
+            vnz += (n - lm + 1)
         end
-        rowptr_p = rowptr
     end
-    parent, colptrc, rowidxc = _coletree_via_csc(rowptr_p, colval_p, m, n)
-    rowcounts = _row_counts(rowptr_p, colval_p, parent, colptrc, rowidxc, m, n)
-    # Map rowcounts (per column k = per row k of R) to per-row capacity for our
-    # row-storage. Our R uses row-storage indexed by row i = 1..m. Row counts
-    # of R are per column k (= per row of R). Row i of R is empty for i > n.
-    # So rowcap[i] = rowcounts[i] for i ≤ n, else 0.
-    rowcap = zeros(Int, m)
-    @inbounds for i in 1:min(m, n)
-        # Add small slack for pivot deviation (5% or +4, whichever larger), capped at n.
-        slack = max(4, rowcounts[i] >> 4)
-        rowcap[i] = min(rowcounts[i] + slack, n)
-    end
-    return rowcap
+    vnz = vnz + max(16, vnz >> 4)
+    return vnz, rnz
 end
 
 # ---------------------------------------------------------------------------
-# csr_factor: numeric factorization given a Symbolic
+# Public API: csr_analyze / csr_factor / csr_refactor! / csr_qr
 # ---------------------------------------------------------------------------
+
+"""
+    csr_analyze(A::SparseMatrixCSR; ordering=:natural) -> CSRQRSymbolic
+
+Symbolic analysis phase for the sparse column-pivoted Householder QR
+factorization. Computes the column permutation `q`, row permutation `pinv`,
+column elimination tree, per-row `leftmost`, and the upper-bound sizes of
+the V (Householder) and R buffers.
+
+`ordering` selects the column ordering:
+  * `:natural` — identity ordering (default; best on dense-fill matrices).
+  * `:amd`     — AMD on AᵀA (requires `using AMD` to enable the extension).
+  * `:colamd`  — alias for `:amd`.
+
+Returns a `CSRQRSymbolic` that can be passed to `csr_factor` and reused via
+`csr_refactor!` for matrices with identical sparsity patterns.
+"""
+function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:natural) where {Bi}
+    m, n = size(A)
+    rowptr, colval = _capture_pattern(A)
+    q, pinv, parent, leftmost_perm, m2, vnz, rnz =
+        _build_symbolic(rowptr, colval, m, n, ordering)
+    return CSRQRSymbolic(m, n, m2, q, pinv, parent, leftmost_perm,
+                          vnz, rnz, ordering, rowptr, colval)
+end
 
 """
     csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing) -> CSRQRFactorization
 
-Numeric factorization of `A` using the symbolic info in `sym`. The initial
-column ordering in `sym.colperm` is used as the starting pivot order; the
-numeric phase may deviate when a candidate column is rank-deficient (the
-column with largest residual norm is swapped in).
+Numeric factorization given a `CSRQRSymbolic`. Implements the Davis
+`cs_qr` algorithm (scatter–apply–emit on a dense workspace) with the V/R
+buffers pre-sized from the symbolic phase.
 
-If `tol === nothing`, the default tolerance `eps(real(T)) * max(m, n) * ||A||_F`
-is used (LAPACK `xgeqp3`-style).
+`tol === nothing` selects the default `eps(real(T)) * max(m, n) * ‖A‖_F`.
+Columns whose post-Householder diagonal magnitude falls below `tol` are
+flagged as rank-deficient: `V[:,k] = 0`, `β_k = 0`, `R[k,k] = 0`. The
+numerical rank is the count of columns whose diagonal magnitude is above
+threshold.
 """
 function csr_factor(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
                     tol::Union{Nothing, Real}=nothing) where {Bi, T}
@@ -439,10 +540,10 @@ end
 """
     csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:natural) -> CSRQRFactorization
 
-One-shot convenience: runs `csr_analyze` and `csr_factor` together. Equivalent to
-`csr_factor(A, csr_analyze(A; ordering); tol)`.
+One-shot convenience: equivalent to `csr_factor(A, csr_analyze(A; ordering); tol)`.
 """
-function csr_qr(A::SparseMatrixCSR{Bi, T}; tol::Union{Nothing, Real}=nothing,
+function csr_qr(A::SparseMatrixCSR{Bi, T};
+                tol::Union{Nothing, Real}=nothing,
                 ordering::Symbol=:natural) where {Bi, T}
     sym = csr_analyze(A; ordering=ordering)
     return csr_factor(A, sym; tol=tol)
@@ -451,15 +552,11 @@ end
 """
     csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing) -> CSRQRFactorization
 
-Numeric refactorization of `A` reusing the symbolic info from `F`. `A` must
-have the same sparsity pattern as the matrix originally factored. If the
-pattern differs, a fresh analyze+factor is performed and a new factorization
-is returned.
+Numeric refactorization. If the sparsity pattern of `A` matches the one
+captured in `F.sym`, the symbolic is reused (skipping the etree / `pinv` /
+`leftmost` work). Otherwise a fresh analyze+factor is performed.
 
-Note: this currently re-runs the full numeric factorization with the same
-`Symbolic`; the gain over `csr_qr` is the avoided `csr_analyze` cost (etree,
-AMD, capacity computation). Returns the resulting factorization (which may or
-may not alias `F` depending on whether allocation was reused).
+Returns a fresh `CSRQRFactorization` (the original is unchanged).
 """
 function csr_refactor!(F::CSRQRFactorization{T},
                        A::SparseMatrixCSR{Bi};
@@ -473,529 +570,575 @@ function csr_refactor!(F::CSRQRFactorization{T},
 end
 
 # ---------------------------------------------------------------------------
-# Numeric kernel (the original csr_qr loop, parameterized by Symbolic)
+# Numeric kernel — Davis cs_qr on the row+column permuted matrix S = P A Q.
 # ---------------------------------------------------------------------------
 
 function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
-                        tol::Union{Nothing, Real}) where {Bi, T}
+                         tol::Union{Nothing, Real}) where {Bi, T}
     m, n = size(A)
     (m == sym.m && n == sym.n) ||
         throw(DimensionMismatch("A is $m x $n but symbolic is $(sym.m) x $(sym.n)"))
 
-    # Build inverse permutation so input column j -> position invperm[j] in R columns.
-    invperm = zeros(Int, n)
-    @inbounds for k in 1:n
-        invperm[sym.colperm[k]] = k
-    end
-
-    R_cols, R_vals = _csr_to_rows(A, invperm, sym.rowcap)
-
-    Vstep_idx = Vector{Vector{Int}}()
-    Vstep_val = Vector{Vector{T}}()
-    tau       = T[]
-
-    # `perm[k]` is the original column index of the column currently in position k.
-    perm = copy(sym.colperm)
-
     RT = real(T)
-    col_nrm2 = zeros(RT, n)
-    @inbounds for i in 1:m
-        ci = R_cols[i]; vi = R_vals[i]
-        for q in eachindex(ci)
-            col_nrm2[ci[q]] += abs2(vi[q])
-        end
-    end
-    col_nrm2_init = copy(col_nrm2)
 
-    fro = sqrt(sum(col_nrm2))
+    # Build CSC of A directly from the CSR.
+    colptr_A, rowval_A, nzval_A, _, _ = _csr_to_csc(A)
+
+    # Frobenius norm of A.
+    fro = zero(RT)
+    @inbounds for p in eachindex(nzval_A)
+        fro += abs2(nzval_A[p])
+    end
+    fro = sqrt(fro)
     tol_use = tol === nothing ? RT(eps(RT) * max(m, n)) * fro : RT(max(tol, 0))
     tol2 = tol_use * tol_use
 
-    kmax = min(m, n)
-    rnk = kmax
+    # Value-aware refinement of column ordering: push numerically-zero columns
+    # to the trailing positions. This makes natural-order back-substitution
+    # produce the correct basic LS solution even when A has linearly dependent
+    # columns. Without this, a zero column in the middle of R causes back-sub
+    # to fail (the row constraint for that index cannot be satisfied by any
+    # later z). Cost: O(n + nnz) per factor call to compute norms + rebuild
+    # the affected symbolic data when zero columns are present.
+    sym_use = _maybe_repivot_zero_cols(A, colptr_A, rowval_A, nzval_A, sym, fro)
 
-    # Reusable workspaces. Vector{Bool} is preferred over BitVector for w_touched
-    # since the inner gather is bit-indexing-heavy.
-    w = zeros(T, n)
-    w_touched = fill(false, n)
-    mark_cols = Int[]
-    sizehint!(mark_cols, n)
-    new_cols_buf = Int[]
-    new_vals_buf = T[]
-    sizehint!(new_cols_buf, 2n)
-    sizehint!(new_vals_buf, 2n)
-    x_idx = Int[]
-    x_val = T[]
-    v_vals = T[]
-    # x_pos[q] = position in R_cols[x_idx[q]] of the column-k entry (cached during gather,
-    # reused during the Householder apply step to avoid a second searchsortedfirst).
-    x_pos = Int[]
+    # Apply row+column permutation: S = (P A Q).
+    colptr_S, rowval_S, nzval_S =
+        _permute_pq(colptr_A, rowval_A, nzval_A, sym_use.pinv, sym_use.q, m, n)
 
-    # Threshold: prefer the column at position k (sparsity-preserving / no swap)
-    # unless it's substantially rank-deficient relative to the best remaining.
-    # Stricter values reduce swaps but risk accepting weak pivots. The value below
-    # is tuned for these workloads — small enough to avoid most cosmetic swaps,
-    # large enough to still catch genuine rank deficiency in the recompute branch.
-    pivot_factor = RT(1e-6)
+    return _csc_qr_numeric(colptr_S, rowval_S, nzval_S, sym_use, tol_use, tol2)
+end
 
-    for k in 1:kmax
-        # --- Pivot column selection ---
-        # First, find the best (max-norm) candidate in k..n.
-        p_best = k
-        best = col_nrm2[k]
-        @inbounds for j in (k + 1):n
-            if col_nrm2[j] > best
-                best = col_nrm2[j]
-                p_best = j
-            end
+# Inspect column norms of A. If any are below `fro * eps(RT) * n` (i.e.,
+# numerically zero), move those columns to the end of `sym.q` and rebuild
+# the value-independent symbolic pieces (parent, leftmost, m2, pinv, vnz, rnz)
+# for the new ordering. Returns either the original `sym` (no zero columns)
+# or a freshly-built one.
+function _maybe_repivot_zero_cols(A::SparseMatrixCSR{Bi, T},
+                                   colptr::Vector{Int}, rowval::Vector{Int},
+                                   nzval::Vector{T}, sym::CSRQRSymbolic,
+                                   fro_A::Real) where {Bi, T}
+    n = sym.n
+    RT = real(T)
+    eps_zero = RT(fro_A) * RT(eps(RT)) * RT(max(sym.m, n))
+    # Column j of A in original indexing.
+    col_norms = zeros(RT, n)
+    @inbounds for j in 1:n
+        s = zero(RT)
+        for p in colptr[j]:(colptr[j + 1] - 1)
+            s += abs2(nzval[p])
         end
-
-        # Default choice = position k (which under sym.colperm is the AMD-preferred
-        # column). Deviate only when the AMD candidate looks rank-deficient relative
-        # to the max-norm column.
-        p = k
-        cand = col_nrm2[k]
-        if cand < pivot_factor * best
-            p = p_best
-            cand = best
-        end
-
-        # Rank-deficiency stop. Before declaring full rank, do a final recompute of
-        # the candidate pivot column's norm if it's suspiciously small relative to
-        # initial (avoid keeping a column whose downdated norm is just rounding noise).
-        if col_nrm2_init[p] > 0 && cand <= sqrt(eps(RT)) * col_nrm2_init[p]
-            s = zero(RT)
-            @inbounds for ii in k:m
-                ci2 = R_cols[ii]; vi2 = R_vals[ii]
-                idx2 = searchsortedfirst(ci2, p)
-                if idx2 <= length(ci2) && ci2[idx2] == p
-                    s += abs2(vi2[idx2])
-                end
-            end
-            cand = s
-            col_nrm2[p] = s
-            col_nrm2_init[p] = s
-            # If recompute reveals the AMD candidate is truly rank-deficient,
-            # re-evaluate against the max-norm candidate.
-            if p == k && cand < pivot_factor * best
-                # Also recompute best to make a fair comparison.
-                s2 = zero(RT)
-                @inbounds for ii in k:m
-                    ci2 = R_cols[ii]; vi2 = R_vals[ii]
-                    idx2 = searchsortedfirst(ci2, p_best)
-                    if idx2 <= length(ci2) && ci2[idx2] == p_best
-                        s2 += abs2(vi2[idx2])
-                    end
-                end
-                col_nrm2[p_best] = s2
-                col_nrm2_init[p_best] = s2
-                if s2 > cand
-                    p = p_best
-                    cand = s2
-                end
-            end
-        end
-        if cand <= tol2
-            # Final defensive recompute: the best candidate might still be live
-            # but the AMD candidate's recomputed value is below tol.
-            if p == k && best > cand
-                # Recompute best column and try again.
-                s2 = zero(RT)
-                @inbounds for ii in k:m
-                    ci2 = R_cols[ii]; vi2 = R_vals[ii]
-                    idx2 = searchsortedfirst(ci2, p_best)
-                    if idx2 <= length(ci2) && ci2[idx2] == p_best
-                        s2 += abs2(vi2[idx2])
-                    end
-                end
-                col_nrm2[p_best] = s2
-                col_nrm2_init[p_best] = s2
-                if s2 > tol2
-                    p = p_best
-                    cand = s2
-                end
-            end
-            if cand <= tol2
-                rnk = k - 1
-                break
-            end
-        end
-
-        # --- Swap columns k and p in R, perm, and norms ---
-        # Single-pass per row: locate k and p simultaneously and apply the
-        # smallest structural change.
-        if p != k
-            # `p` may be > or < k in general, but the rank-revealing pivot keeps p >= k
-            # by construction (we pivot from positions k..n). Ensure k_lo < p_hi.
-            k_lo, p_hi = k < p ? (k, p) : (p, k)
-            col_nrm2[k], col_nrm2[p] = col_nrm2[p], col_nrm2[k]
-            col_nrm2_init[k], col_nrm2_init[p] = col_nrm2_init[p], col_nrm2_init[k]
-            perm[k], perm[p] = perm[p], perm[k]
-            @inbounds for i in 1:m
-                ci = R_cols[i]; vi = R_vals[i]
-                L = length(ci)
-                L == 0 && continue
-                # Find idx_lo = position of k_lo (or insertion position).
-                idx_lo = searchsortedfirst(ci, k_lo)
-                has_lo = idx_lo <= L && ci[idx_lo] == k_lo
-                # Find idx_hi >= idx_lo (binary search restricted).
-                idx_hi = searchsortedfirst(view(ci, idx_lo:L), p_hi) + idx_lo - 1
-                has_hi = idx_hi <= L && ci[idx_hi] == p_hi
-                if !has_lo && !has_hi
-                    continue
-                end
-                if has_lo && has_hi
-                    # Both present: swap values in place; no structural change.
-                    vi[idx_lo], vi[idx_hi] = vi[idx_hi], vi[idx_lo]
-                elseif has_lo
-                    # Move k_lo -> p_hi position.
-                    # Shift entries [idx_lo+1 : idx_hi-1] left by one, write p_hi at idx_hi-1.
-                    v_save = vi[idx_lo]
-                    for t in idx_lo:(idx_hi - 2)
-                        ci[t] = ci[t + 1]
-                        vi[t] = vi[t + 1]
-                    end
-                    ci[idx_hi - 1] = p_hi
-                    vi[idx_hi - 1] = v_save
-                else  # has_hi only
-                    # Move p_hi -> k_lo position.
-                    # Shift entries [idx_lo : idx_hi-1] right by one, write k_lo at idx_lo.
-                    v_save = vi[idx_hi]
-                    for t in idx_hi:-1:(idx_lo + 1)
-                        ci[t] = ci[t - 1]
-                        vi[t] = vi[t - 1]
-                    end
-                    ci[idx_lo] = k_lo
-                    vi[idx_lo] = v_save
-                end
-            end
-        end
-
-        # --- Gather column-k entries from rows k..m to build Householder x ---
-        empty!(x_idx); empty!(x_val); empty!(x_pos)
-        @inbounds for i in k:m
-            ci = R_cols[i]; vi = R_vals[i]
-            idx = searchsortedfirst(ci, k)
-            if idx <= length(ci) && ci[idx] == k
-                v = vi[idx]
-                if v != 0
-                    push!(x_idx, i)
-                    push!(x_val, v)
-                    push!(x_pos, idx)
-                end
-            end
-        end
-
-        if isempty(x_idx)
-            rnk = k - 1
+        col_norms[j] = s
+    end
+    # Threshold: a column is "zero" if its squared norm is at or below the
+    # tolerance. We use eps_zero² to match the standard tol formulation.
+    thr2 = eps_zero * eps_zero
+    has_zero = false
+    @inbounds for j in 1:n
+        if col_norms[j] <= thr2
+            has_zero = true
             break
         end
-
-        # Ensure row k is first (so v[1] corresponds to row k -> diagonal slot)
-        if x_idx[1] != k
-            pushfirst!(x_idx, k)
-            pushfirst!(x_val, zero(T))
-            # Row k didn't have column k yet; will be inserted later. Sentinel value 0
-            # indicates "no cached position" — the apply step will recompute via search.
-            pushfirst!(x_pos, 0)
+    end
+    if !has_zero
+        return sym
+    end
+    # Build refined q': non-zero columns in the existing q-order first, then
+    # zero columns at the end.
+    q_new = Vector{Int}(undef, n)
+    pos = 1
+    @inbounds for k in 1:n
+        j = sym.q[k]
+        if col_norms[j] > thr2
+            q_new[pos] = j
+            pos += 1
         end
-
-        # --- Compute Householder reflector: alpha, v, tau ---
-        normx2 = zero(RT)
-        @inbounds for q in eachindex(x_val)
-            normx2 += abs2(x_val[q])
+    end
+    @inbounds for k in 1:n
+        j = sym.q[k]
+        if col_norms[j] <= thr2
+            q_new[pos] = j
+            pos += 1
         end
-        normx = sqrt(normx2)
+    end
+    # If no change, just return sym.
+    if q_new == sym.q
+        return sym
+    end
 
-        x1 = x_val[1]
-        if T <: Real
-            sgn = x1 >= 0 ? one(T) : -one(T)
+    # Rebuild symbolic with the new q'.
+    q2, pinv2, parent2, leftmost2, m2_2, vnz2, rnz2 =
+        _rebuild_symbolic_for_q(sym.pattern_rowptr, sym.pattern_colval,
+                                 sym.m, sym.n, q_new)
+    return CSRQRSymbolic(sym.m, sym.n, m2_2, q2, pinv2, parent2, leftmost2,
+                         vnz2, rnz2, sym.ordering, sym.pattern_rowptr,
+                         sym.pattern_colval)
+end
+
+# Rebuild symbolic data for a given q (a column permutation).
+function _rebuild_symbolic_for_q(rowptr::Vector{Int}, colval::Vector{Int},
+                                  m::Int, n::Int, q::Vector{Int})
+    # Reuse _build_symbolic but force the q we've chosen.
+    colptr_A, rowval_A = _csr_pattern_to_csc(rowptr, colval, m, n)
+    colptr_q, rowval_q = _permute_cols(colptr_A, rowval_A, q, m, n)
+    parent = _coletree_ata(colptr_q, rowval_q, m, n)
+
+    leftmost_orig = zeros(Int, m)
+    @inbounds for k in 1:n
+        c1 = colptr_q[k]; c2 = colptr_q[k + 1] - 1
+        for p in c1:c2
+            i = rowval_q[p]
+            if leftmost_orig[i] == 0
+                leftmost_orig[i] = k
+            end
+        end
+    end
+
+    head = fill(0, n + 1)
+    nxt = zeros(Int, m)
+    @inbounds for i in m:-1:1
+        if leftmost_orig[i] != 0
+            k = leftmost_orig[i]
+            nxt[i] = head[k]
+            head[k] = i
         else
-            sgn = x1 == 0 ? one(T) : x1 / abs(x1)
+            nxt[i] = head[n + 1]
+            head[n + 1] = i
         end
-        alpha = -sgn * normx
-
-        resize!(v_vals, length(x_val))
-        copyto!(v_vals, x_val)
-        v_vals[1] = x1 - alpha
-
-        vnorm2 = zero(RT)
-        @inbounds for q in eachindex(v_vals)
-            vnorm2 += abs2(v_vals[q])
-        end
-
-        if vnorm2 == 0
-            rnk = k - 1
-            break
-        end
-
-        tau_k = T(2) / T(vnorm2)
-
-        # --- Apply H = I - tau v v^H to columns j > k of rows in x_idx ---
-        empty!(mark_cols)
-        nrows_v = length(x_idx)
-        @inbounds for q in 1:nrows_v
-            i = x_idx[q]
-            vi_q = v_vals[q]
-            if vi_q == 0
-                continue
-            end
-            cvi_q = conj(vi_q)
-            ci = R_cols[i]; vi = R_vals[i]
-            # Tail starts immediately after the cached column-k position (if any).
-            pos = x_pos[q]
-            start = (pos == 0) ? searchsortedfirst(ci, k + 1) : pos + 1
-            for p2 in start:length(ci)
-                j = ci[p2]
-                if !w_touched[j]
-                    w_touched[j] = true
-                    push!(mark_cols, j)
-                end
-                w[j] += cvi_q * vi[p2]
-            end
-        end
-
-        sort!(mark_cols)
-
-        @inbounds for q in 1:nrows_v
-            i = x_idx[q]
-            vi_q = v_vals[q]
-            if vi_q == 0
-                continue
-            end
-            factor = tau_k * vi_q
-            ci = R_cols[i]; vi = R_vals[i]
-            pos = x_pos[q]
-            start = (pos == 0) ? searchsortedfirst(ci, k + 1) : pos + 1
-            old_total_len = length(ci)
-            la = old_total_len - start + 1
-            lb = length(mark_cols)
-
-            # Resize scratch buffer to upper bound (la + lb).
-            new_max = la + lb
-            resize!(new_cols_buf, new_max)
-            resize!(new_vals_buf, new_max)
-            nwrite = 0
-            # Pre-offset for faster ci/vi indexing.
-            sm1 = start - 1
-            a = 1; b = 1
-            while a <= la && b <= lb
-                ca = ci[sm1 + a]
-                cb = mark_cols[b]
-                if ca == cb
-                    nv = vi[sm1 + a] - factor * w[cb]
-                    if nv != 0
-                        nwrite += 1
-                        new_cols_buf[nwrite] = ca
-                        new_vals_buf[nwrite] = nv
-                    end
-                    a += 1; b += 1
-                elseif ca < cb
-                    nwrite += 1
-                    new_cols_buf[nwrite] = ca
-                    new_vals_buf[nwrite] = vi[sm1 + a]
-                    a += 1
-                else
-                    nv = -factor * w[cb]
-                    if nv != 0
-                        nwrite += 1
-                        new_cols_buf[nwrite] = cb
-                        new_vals_buf[nwrite] = nv
-                    end
-                    b += 1
-                end
-            end
-            while a <= la
-                nwrite += 1
-                new_cols_buf[nwrite] = ci[sm1 + a]
-                new_vals_buf[nwrite] = vi[sm1 + a]
-                a += 1
-            end
-            # Tail of mark_cols (only fill-in): scan and write.
-            while b <= lb
-                cb = mark_cols[b]
-                nv = -factor * w[cb]
-                if nv != 0
-                    nwrite += 1
-                    new_cols_buf[nwrite] = cb
-                    new_vals_buf[nwrite] = nv
-                end
-                b += 1
-            end
-
-            new_total_len = sm1 + nwrite
-            if new_total_len != old_total_len
-                resize!(ci, new_total_len)
-                resize!(vi, new_total_len)
-            end
-            # Copy nwrite elements from scratch buffer into ci/vi at offset start-1.
-            if nwrite > 0
-                copyto!(ci, start, new_cols_buf, 1, nwrite)
-                copyto!(vi, start, new_vals_buf, 1, nwrite)
-            end
-        end
-
-        @inbounds for j in mark_cols
-            w[j] = zero(T)
-            w_touched[j] = false
-        end
-
-        # --- Set R[k, k] = alpha; drop R[i, k] for i > k (they go to v storage) ---
-        # The apply step preserved x_pos[q] (the column-k entry position in row i),
-        # because it only overwrote positions start = x_pos[q] + 1 onward. Reuse it
-        # to skip a redundant binary search.
-        @inbounds begin
-            ck = R_cols[k]; vk = R_vals[k]
-            pos1 = x_pos[1]
-            if pos1 != 0
-                # Row k already had column k.
-                vk[pos1] = T(alpha)
-            else
-                # Insert column k at the right sorted position in row k.
-                idx = searchsortedfirst(ck, k)
-                insert!(ck, idx, k)
-                insert!(vk, idx, T(alpha))
-            end
-        end
-        @inbounds for q in 1:nrows_v
-            i = x_idx[q]
-            i == k && continue
-            pos = x_pos[q]
-            ci_i = R_cols[i]; vi_i = R_vals[i]
-            if pos != 0 && pos <= length(ci_i) && ci_i[pos] == k
-                deleteat!(ci_i, pos)
-                deleteat!(vi_i, pos)
-            else
-                row_remove!(ci_i, vi_i, k)
-            end
-        end
-
-        # --- Store Householder vector step-wise ---
-        push!(tau, tau_k)
-        vidx = Int[];   sizehint!(vidx, nrows_v)
-        vval = T[];     sizehint!(vval, nrows_v)
-        @inbounds for q in 1:nrows_v
-            vv = v_vals[q]
-            vv == 0 && continue
-            push!(vidx, x_idx[q])
-            push!(vval, vv)
-        end
-        push!(Vstep_idx, vidx)
-        push!(Vstep_val, vval)
-
-        # --- Downdate column norms for j > k ---
-        @inbounds begin
-            ck = R_cols[k]; vk_ = R_vals[k]
-            startc = searchsortedfirst(ck, k + 1)
-            recompute_thresh = RT(sqrt(eps(RT)))
-            for p2 in startc:length(ck)
-                j = ck[p2]
-                old = col_nrm2[j]
-                col_nrm2[j] = old - abs2(vk_[p2])
-                if col_nrm2[j] < 0
-                    col_nrm2[j] = zero(RT)
-                end
-                if col_nrm2[j] <= recompute_thresh * col_nrm2_init[j]
-                    s = zero(RT)
-                    for ii in (k + 1):m
-                        ci2 = R_cols[ii]; vi2 = R_vals[ii]
-                        idx2 = searchsortedfirst(ci2, j)
-                        if idx2 <= length(ci2) && ci2[idx2] == j
-                            s += abs2(vi2[idx2])
-                        end
-                    end
-                    col_nrm2[j] = s
-                    col_nrm2_init[j] = s
-                end
-            end
-        end
-        col_nrm2[k] = zero(RT)
     end
 
-    return CSRQRFactorization{T, RT}(m, n, R_cols, R_vals, Vstep_idx, Vstep_val,
-                                     tau, perm, rnk, tol_use, sym)
+    pinv = zeros(Int, m)
+    m2 = 0
+    @inbounds for k in 1:n
+        if head[k] == 0
+            m2 += 1
+        else
+            j = head[k]
+            while j != 0
+                m2 += 1
+                j = nxt[j]
+            end
+        end
+    end
+    nempty = 0
+    @inbounds begin
+        ii = head[n + 1]
+        while ii != 0
+            nempty += 1
+            ii = nxt[ii]
+        end
+    end
+    m2 += nempty
+
+    nextslot = n + 1
+    @inbounds for k in 1:n
+        i = head[k]
+        if i != 0
+            pinv[i] = k
+            j = nxt[i]
+            while j != 0
+                pinv[j] = nextslot
+                nextslot += 1
+                j = nxt[j]
+            end
+        end
+    end
+    @inbounds begin
+        ii = head[n + 1]
+        while ii != 0
+            pinv[ii] = nextslot
+            nextslot += 1
+            ii = nxt[ii]
+        end
+    end
+
+    leftmost_perm = zeros(Int, m2)
+    @inbounds for i in 1:m
+        leftmost_perm[pinv[i]] = leftmost_orig[i]
+    end
+    @inbounds for slot in 1:m2
+        if leftmost_perm[slot] == 0
+            leftmost_perm[slot] = slot <= n ? slot : 0
+        end
+    end
+
+    vnz, rnz = _vnz_rnz_estimate(colptr_q, rowval_q, parent, leftmost_orig,
+                                  m, n)
+    return q, pinv, parent, leftmost_perm, m2, vnz, rnz
+end
+
+# Numeric loop. Returns a CSRQRFactorization.
+function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
+                         nzval::Vector{T}, sym::CSRQRSymbolic,
+                         tol_use::RT, tol2::RT) where {T, RT}
+    m, n, m2 = sym.m, sym.n, sym.m2
+    parent = sym.parent
+    leftmost = sym.leftmost
+
+    V = _alloc_csc(T, m2, n, sym.vnz)
+    R = _alloc_csc(T, n, n, sym.rnz)
+    beta = zeros(RT, n)
+
+    # Workspaces.
+    x = zeros(T, m2)
+    s = zeros(Int, n)
+    w = zeros(Int, n)       # ereach marker by column (mark = k each step)
+    rowmark = zeros(Int, m2)  # V-pattern marker by row (mark = k each step)
+    vrows = zeros(Int, m2)
+
+    V.colptr[1] = 1
+    R.colptr[1] = 1
+    rnz_total = 0
+    vnz_total = 0
+    rnk = 0
+
+    @inbounds for k in 1:n
+        # --- 1) ereach pattern of R[:,k] + scatter S[:,k] into x ---------
+        top = n + 1
+        c1 = colptr[k]; c2 = colptr[k + 1] - 1
+        vlen = 0
+        for p in c1:c2
+            i = rowval[p]
+            x[i] = nzval[p]
+            if rowmark[i] != k
+                rowmark[i] = k
+                vlen += 1
+                vrows[vlen] = i
+            end
+            lm = leftmost[i]
+            if lm > 0 && lm <= k
+                len = 0
+                jj = lm
+                while jj != 0 && w[jj] != k && jj < k
+                    s[len + 1] = jj
+                    len += 1
+                    w[jj] = k
+                    jj = parent[jj]
+                end
+                # Davis cs_ereach: transfer s[1..len] to s[top-len..top-1] in
+                # increasing-column-index order. Iteration is `--top, --len;
+                # s[top] = s[len]`, which moves s[len] (largest col) to
+                # s[top-1], and s[1] (smallest col = lm) ends up at s[top-len].
+                while len > 0
+                    top -= 1
+                    s[top] = s[len]
+                    len -= 1
+                end
+            end
+        end
+
+        # --- 2) Apply previous Householders ------------------------------
+        # Pattern in s[top..n] is in increasing column index. Iterate that
+        # order: apply H_1, H_2, ..., H_{k-1} (the original order of the
+        # outer QR loop).
+        for spos in top:n
+            p_idx = s[spos]
+            if p_idx == k
+                continue
+            end
+            vc1 = V.colptr[p_idx]; vc2 = V.colptr[p_idx + 1] - 1
+            # Bring V[:,p_idx]'s rows into V[:,k]'s pattern (they may now have x).
+            for vp in vc1:vc2
+                ri = V.rowval[vp]
+                if rowmark[ri] != k
+                    rowmark[ri] = k
+                    vlen += 1
+                    vrows[vlen] = ri
+                end
+            end
+            bk = beta[p_idx]
+            if vc2 >= vc1 && bk != 0
+                tau = zero(T)
+                for vp in vc1:vc2
+                    tau += conj(V.nzval[vp]) * x[V.rowval[vp]]
+                end
+                if tau != 0
+                    tau_b = T(bk) * tau
+                    for vp in vc1:vc2
+                        x[V.rowval[vp]] -= tau_b * V.nzval[vp]
+                    end
+                end
+            end
+            # Emit R[p_idx, k] = x[p_idx]; clear x[p_idx].
+            if rnz_total + 1 > length(R.rowval)
+                _grow_csc!(R, rnz_total + 1)
+            end
+            rnz_total += 1
+            R.rowval[rnz_total] = p_idx
+            R.nzval[rnz_total] = x[p_idx]
+            x[p_idx] = zero(T)
+        end
+
+        # Ensure row k is in vrows.
+        if rowmark[k] != k
+            rowmark[k] = k
+            vlen += 1
+            vrows[vlen] = k
+        end
+
+        # Move row k to slot 1 and drop any vrows[i] < k.
+        # First find k's current position and swap to slot 1.
+        if vrows[1] != k
+            kpos = 0
+            for q in 1:vlen
+                if vrows[q] == k
+                    kpos = q; break
+                end
+            end
+            if kpos > 1
+                vrows[kpos] = vrows[1]; vrows[1] = k
+            end
+        end
+        # Compact: keep vrows[1] = k, keep vrows[i] > k for i >= 2.
+        w2 = 1
+        for q in 2:vlen
+            ri = vrows[q]
+            if ri > k
+                w2 += 1
+                vrows[w2] = ri
+            end
+        end
+        vlen = w2
+
+        # --- 3) Build Householder for x[vrows[1..vlen]] -----------------
+        # Compute alpha, beta_k. v[1] = x[vrows[1]] - alpha; v[j>=2] unchanged.
+        nrm2 = zero(RT)
+        for q in 1:vlen
+            nrm2 += abs2(x[vrows[q]])
+        end
+
+        # --- 4) Emit R[k,k] and V[:,k], or mark rank-deficient -----------
+        # Allocate row for R[k,k] first.
+        if rnz_total + 1 > length(R.rowval)
+            _grow_csc!(R, rnz_total + 1)
+        end
+
+        if nrm2 <= tol2 || vlen == 0
+            # Rank-deficient column. R[k,k] = 0 (but emit, so R has a diagonal).
+            rnz_total += 1
+            R.rowval[rnz_total] = k
+            R.nzval[rnz_total] = zero(T)
+            R.colptr[k + 1] = rnz_total + 1
+            V.colptr[k + 1] = vnz_total + 1
+            beta[k] = zero(RT)
+            # Clear x at v-pattern rows (vrows[1..vlen]).
+            for q in 1:vlen
+                x[vrows[q]] = zero(T)
+            end
+            continue
+        end
+
+        x1 = x[vrows[1]]
+        sgn = if T <: Real
+            x1 >= 0 ? one(T) : -one(T)
+        else
+            x1 == 0 ? one(T) : x1 / abs(x1)
+        end
+        nrm = sqrt(nrm2)
+        alpha = -sgn * nrm
+        v1 = x1 - alpha
+        # vnorm2 = |v1|^2 + sum_{j>=2} |x[j]|^2 = |v1|^2 + (nrm2 - |x1|^2)
+        vnorm2 = abs2(v1) + (nrm2 - abs2(x1))
+
+        if vnorm2 <= zero(RT)
+            # Pathological: H = I. Treat as rank-deficient pivot.
+            rnz_total += 1
+            R.rowval[rnz_total] = k
+            R.nzval[rnz_total] = T(alpha)
+            R.colptr[k + 1] = rnz_total + 1
+            V.colptr[k + 1] = vnz_total + 1
+            beta[k] = zero(RT)
+            for q in 1:vlen
+                x[vrows[q]] = zero(T)
+            end
+            if abs(alpha) > tol_use
+                rnk += 1
+            end
+            continue
+        end
+
+        beta_k = RT(2) / vnorm2
+
+        # Emit R[k, k] = alpha.
+        rnz_total += 1
+        R.rowval[rnz_total] = k
+        R.nzval[rnz_total] = T(alpha)
+        R.colptr[k + 1] = rnz_total + 1
+
+        # Emit V[:,k]: first slot is row k with value v1; remaining slots are
+        # vrows[2..vlen] with values x[vrows[q]].
+        if vnz_total + vlen > length(V.rowval)
+            _grow_csc!(V, vnz_total + vlen)
+        end
+        vnz_total += 1
+        V.rowval[vnz_total] = k
+        V.nzval[vnz_total] = v1
+        for q in 2:vlen
+            vnz_total += 1
+            V.rowval[vnz_total] = vrows[q]
+            V.nzval[vnz_total] = x[vrows[q]]
+        end
+        V.colptr[k + 1] = vnz_total + 1
+
+        beta[k] = beta_k
+        rnk += 1
+
+        # Clear x at v-pattern rows.
+        for q in 1:vlen
+            x[vrows[q]] = zero(T)
+        end
+    end
+
+    # Trim V/R to actual sizes.
+    resize!(V.rowval, vnz_total); resize!(V.nzval, vnz_total)
+    resize!(R.rowval, rnz_total); resize!(R.nzval, rnz_total)
+
+    return CSRQRFactorization{T, RT}(sym.m, sym.n,
+        V.colptr, V.rowval, V.nzval,
+        R.colptr, R.rowval, R.nzval,
+        beta, rnk, tol_use, sym)
 end
 
 # ---------------------------------------------------------------------------
-# Solve path
+# Solve path.
 # ---------------------------------------------------------------------------
+#
+# Given F representing P A Q = Q_H R (where Q_H is the product of Householders
+# stored in V), to solve A x = b:
+#   1) work = P b (i.e. work[pinv[i]] = b[i]; pad slots > m with zeros).
+#   2) Apply Q_H^T = H_n ... H_1 to work: work := Q_H^T work.
+#   3) Solve R x' = work[1:n] in place (upper-triangular, columnwise).
+#   4) x = Q_perm x': x[q[k]] = x'[k].
 
-function applyQH!(y::AbstractVector{T}, F::CSRQRFactorization{T}) where {T}
-    nstep = length(F.tau)
-    @inbounds for k in 1:nstep
-        vidx = F.Vstep_idx[k]; vval = F.Vstep_val[k]
-        nz = length(vidx)
-        nz == 0 && continue
-        beta = zero(T)
-        for q in 1:nz
-            beta += conj(vval[q]) * y[vidx[q]]
+function _apply_QH!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
+    Vp = F.V_colptr; Vi = F.V_rowval; Vx = F.V_nzval; beta = F.beta
+    n = F.n
+    @inbounds for k in 1:n
+        bk = beta[k]
+        bk == 0 && continue
+        vc1 = Vp[k]; vc2 = Vp[k + 1] - 1
+        vc2 < vc1 && continue
+        tau = zero(T)
+        for vp in vc1:vc2
+            tau += conj(Vx[vp]) * work[Vi[vp]]
         end
-        if beta == 0
+        if tau == 0
             continue
         end
-        tk_conj = conj(F.tau[k])
-        for q in 1:nz
-            y[vidx[q]] -= tk_conj * vval[q] * beta
+        tau_b = T(bk) * tau
+        for vp in vc1:vc2
+            work[Vi[vp]] -= tau_b * Vx[vp]
         end
     end
-    return y
+    return work
 end
 
-function applyQ!(y::AbstractVector{T}, F::CSRQRFactorization{T}) where {T}
-    nstep = length(F.tau)
-    @inbounds for k in nstep:-1:1
-        vidx = F.Vstep_idx[k]; vval = F.Vstep_val[k]
-        nz = length(vidx)
-        nz == 0 && continue
-        beta = zero(T)
-        for q in 1:nz
-            beta += conj(vval[q]) * y[vidx[q]]
+function _apply_Q!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
+    Vp = F.V_colptr; Vi = F.V_rowval; Vx = F.V_nzval; beta = F.beta
+    n = F.n
+    @inbounds for k in n:-1:1
+        bk = beta[k]
+        bk == 0 && continue
+        vc1 = Vp[k]; vc2 = Vp[k + 1] - 1
+        vc2 < vc1 && continue
+        tau = zero(T)
+        for vp in vc1:vc2
+            tau += conj(Vx[vp]) * work[Vi[vp]]
         end
-        if beta == 0
+        if tau == 0
             continue
         end
-        tk = F.tau[k]
-        for q in 1:nz
-            y[vidx[q]] -= tk * vval[q] * beta
+        tau_b = T(bk) * tau
+        for vp in vc1:vc2
+            work[Vi[vp]] -= tau_b * Vx[vp]
         end
     end
-    return y
+    return work
 end
 
-function backsub_R!(z::AbstractVector{T}, F::CSRQRFactorization{T}, c::AbstractVector{T}) where {T}
-    rnk = F.rnk
-    @inbounds for i in 1:rnk
+# Solve R z = c (R is upper triangular in CSC). Rank-revealing: rows
+# (k+1..n) of z are zeroed if R[k,k] is below threshold.
+function _usolve!(z::AbstractVector{T}, F::CSRQRFactorization{T},
+                   c::AbstractVector{T}) where {T}
+    n = F.n
+    Rp = F.R_colptr; Ri = F.R_rowval; Rx = F.R_nzval
+    tol_use = F.tol
+    @inbounds for i in 1:n
         z[i] = c[i]
     end
-    @inbounds for i in rnk:-1:1
-        ci = F.R_cols[i]; vi = F.R_vals[i]
-        diag_idx = searchsortedfirst(ci, i)
-        if diag_idx > length(ci) || ci[diag_idx] != i
-            error("Missing R diagonal at row $i (factorization is corrupt or rank stopped early)")
+    # Davis-style usolve on a CSC upper triangular: walk k from n down to 1.
+    # For column k of R: the entries are R[i,k] for i <= k. Diagonal is at
+    # one of these slots; identify it. Iterate column k from bottom to top.
+    @inbounds for k in n:-1:1
+        rc1 = Rp[k]; rc2 = Rp[k + 1] - 1
+        # Find the diagonal (the entry with row index k). For an in-order
+        # CSC R (which our emit guarantees: pattern emitted in ereach
+        # topological order, then diag last), the diagonal is at the LAST
+        # slot Rp[k+1]-1. Verify and fall back to search if not.
+        diag_p = 0
+        if rc2 >= rc1 && Ri[rc2] == k
+            diag_p = rc2
+        else
+            for p in rc1:rc2
+                if Ri[p] == k
+                    diag_p = p; break
+                end
+            end
         end
-        s = z[i]
-        for p in (diag_idx + 1):length(ci)
-            j = ci[p]
-            j > rnk && break
-            s -= vi[p] * z[j]
+        if diag_p == 0
+            # Missing diagonal: column is structurally absent. Treat as
+            # rank-deficient: set z[k] = 0.
+            z[k] = zero(T)
+            continue
         end
-        z[i] = s / vi[diag_idx]
-    end
-    @inbounds for i in (rnk + 1):length(z)
-        z[i] = zero(T)
+        d = Rx[diag_p]
+        if abs(d) <= tol_use || d == 0
+            # Rank-deficient row; set z[k] = 0 (basic LS solution).
+            z[k] = zero(T)
+            # Still need to subtract z[k] contributions from above rows in
+            # higher steps? No: we go k from n down, so above rows handle
+            # themselves. We just don't propagate the zero down.
+            continue
+        end
+        z[k] /= d
+        zk = z[k]
+        # Subtract z[k] * R[i, k] from z[i] for i < k.
+        for p in rc1:rc2
+            p == diag_p && continue
+            i = Ri[p]
+            z[i] -= Rx[p] * zk
+        end
     end
     return z
 end
 
-function LinearAlgebra.ldiv!(x::AbstractVector{T}, F::CSRQRFactorization{T}, b::AbstractVector{T}) where {T}
+function LinearAlgebra.ldiv!(x::AbstractVector{T}, F::CSRQRFactorization{T},
+                              b::AbstractVector{T}) where {T}
     length(b) == F.m || throw(DimensionMismatch("b length $(length(b)) != m=$(F.m)"))
     length(x) == F.n || throw(DimensionMismatch("x length $(length(x)) != n=$(F.n)"))
-    y = copy(b)
-    applyQH!(y, F)
-    z = Vector{T}(undef, F.n)
-    backsub_R!(z, F, y)
-    @inbounds for k in 1:F.n
-        x[F.perm[k]] = z[k]
+    m, n, m2 = F.m, F.n, F.sym.m2
+    pinv = F.sym.pinv
+    q = F.sym.q
+
+    # Workspace sized to m2 (handles fictitious rows).
+    work = zeros(T, m2)
+    @inbounds for i in 1:m
+        work[pinv[i]] = b[i]
+    end
+    # Slots m+1..m2 stay zero (fictitious rows).
+
+    _apply_QH!(F, work)
+
+    # Solve R x' = work[1:n].
+    xprime = Vector{T}(undef, n)
+    @inbounds for k in 1:n
+        xprime[k] = work[k]
+    end
+    _usolve!(xprime, F, xprime)
+
+    # x[q[k]] = x'[k].
+    @inbounds for k in 1:n
+        x[q[k]] = xprime[k]
     end
     return x
 end

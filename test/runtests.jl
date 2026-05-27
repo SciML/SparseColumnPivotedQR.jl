@@ -179,9 +179,9 @@ end
         sym_col = csr_analyze(Acsr; ordering=:colamd)
 
         # AMD should produce a non-identity permutation on a random matrix
-        @test sym_amd.colperm != 1:n
+        @test sym_amd.q != 1:n
         # colamd ordering is currently aliased to amd
-        @test sym_col.colperm == sym_amd.colperm
+        @test sym_col.q == sym_amd.q
 
         F_nat = csr_factor(Acsr, sym_nat); x_nat = F_nat \ b
         F_amd = csr_factor(Acsr, sym_amd); x_amd = F_amd \ b
@@ -192,8 +192,8 @@ end
         @test norm(A * x_amd - b) / norm(b) < 1e-10
 
         # AMD should not blow up fill: total nnz(R) <= natural's by a reasonable factor
-        nnz_nat = sum(length, F_nat.R_cols)
-        nnz_amd = sum(length, F_amd.R_cols)
+        nnz_nat = length(F_nat.R_nzval)
+        nnz_amd = length(F_amd.R_nzval)
         # No strict inequality (AMD can lose on some matrices), but shouldn't be wildly worse.
         @test nnz_amd <= 4 * nnz_nat
     end
