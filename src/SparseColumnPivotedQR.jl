@@ -188,65 +188,6 @@ Base.eltype(::CSRQRFactorization{T}) where {T} = T
 # CSR <-> CSC conversion (pattern + values)
 # ---------------------------------------------------------------------------
 
-function _csr_to_csc(A::SparseMatrixCSR{Bi, T}) where {Bi, T}
-    m, n = size(A)
-    off = getoffset(A)
-    rowptr = A.rowptr
-    colval = A.colval
-    nzval_in = A.nzval
-    nnz_total = length(colval)
-
-    colcounts = zeros(Int, n)
-    @inbounds for p in 1:nnz_total
-        colcounts[Int(colval[p]) + off] += 1
-    end
-    colptr = Vector{Int}(undef, n + 1)
-    colptr[1] = 1
-    @inbounds for j in 1:n
-        colptr[j + 1] = colptr[j] + colcounts[j]
-    end
-    rowval = Vector{Int}(undef, nnz_total)
-    nzval = Vector{T}(undef, nnz_total)
-    work = copy(colptr)
-    @inbounds for i in 1:m
-        r1 = rowptr[i] + off
-        r2 = rowptr[i + 1] + off - 1
-        for p in r1:r2
-            j = Int(colval[p]) + off
-            slot = work[j]
-            rowval[slot] = i
-            nzval[slot] = nzval_in[p]
-            work[j] = slot + 1
-        end
-    end
-    return colptr, rowval, nzval, m, n
-end
-
-function _csr_pattern_to_csc(rowptr::Vector{Int}, colval::Vector{Int},
-                             m::Int, n::Int)
-    nnz_total = length(colval)
-    colcounts = zeros(Int, n)
-    @inbounds for p in 1:nnz_total
-        colcounts[colval[p]] += 1
-    end
-    colptr = Vector{Int}(undef, n + 1)
-    colptr[1] = 1
-    @inbounds for j in 1:n
-        colptr[j + 1] = colptr[j] + colcounts[j]
-    end
-    rowval = Vector{Int}(undef, nnz_total)
-    work = copy(colptr)
-    @inbounds for i in 1:m
-        r1 = rowptr[i]; r2 = rowptr[i + 1] - 1
-        for p in r1:r2
-            j = colval[p]
-            rowval[work[j]] = i
-            work[j] += 1
-        end
-    end
-    return colptr, rowval
-end
-
 function _capture_pattern(A::SparseMatrixCSR{Bi}) where {Bi}
     off = getoffset(A)
     rowptr = Vector{Int}(undef, length(A.rowptr))
@@ -364,67 +305,6 @@ function _coletree_ata(colptr::Vector{Int}, rowval::Vector{Int}, m::Int, n::Int)
     return parent
 end
 
-# Permute CSC pattern: output column k = input column q[k].
-function _permute_cols(colptr::Vector{Int}, rowval::Vector{Int},
-                       q::Vector{Int}, m::Int, n::Int)
-    nnz_total = length(rowval)
-    colptr_q = Vector{Int}(undef, n + 1)
-    colptr_q[1] = 1
-    @inbounds for k in 1:n
-        j = q[k]
-        colptr_q[k + 1] = colptr_q[k] + (colptr[j + 1] - colptr[j])
-    end
-    rowval_q = Vector{Int}(undef, nnz_total)
-    @inbounds for k in 1:n
-        j = q[k]
-        src = colptr[j]; n_in_col = colptr[j + 1] - colptr[j]
-        dst = colptr_q[k]
-        for t in 0:(n_in_col - 1)
-            rowval_q[dst + t] = rowval[src + t]
-        end
-    end
-    return colptr_q, rowval_q
-end
-
-# Apply both perms (P A Q): output col k = (PA)[:, q[k]]. Row i becomes pinv[i].
-# Also permutes nzval if provided.
-function _permute_pq(colptr::Vector{Int}, rowval::Vector{Int},
-                     nzval::Union{Nothing, Vector{T}},
-                     pinv::Vector{Int}, q::Vector{Int},
-                     m::Int, n::Int) where {T}
-    nnz_total = length(rowval)
-    colptr_pq = Vector{Int}(undef, n + 1)
-    colptr_pq[1] = 1
-    @inbounds for k in 1:n
-        j = q[k]
-        colptr_pq[k + 1] = colptr_pq[k] + (colptr[j + 1] - colptr[j])
-    end
-    rowval_pq = Vector{Int}(undef, nnz_total)
-    if nzval === nothing
-        @inbounds for k in 1:n
-            j = q[k]
-            src = colptr[j]; n_in_col = colptr[j + 1] - colptr[j]
-            dst = colptr_pq[k]
-            for t in 0:(n_in_col - 1)
-                rowval_pq[dst + t] = pinv[rowval[src + t]]
-            end
-        end
-        return colptr_pq, rowval_pq, nothing
-    else
-        nzval_pq = Vector{T}(undef, nnz_total)
-        @inbounds for k in 1:n
-            j = q[k]
-            src = colptr[j]; n_in_col = colptr[j + 1] - colptr[j]
-            dst = colptr_pq[k]
-            for t in 0:(n_in_col - 1)
-                rowval_pq[dst + t] = pinv[rowval[src + t]]
-                nzval_pq[dst + t] = nzval[src + t]
-            end
-        end
-        return colptr_pq, rowval_pq, nzval_pq
-    end
-end
-
 # ---------------------------------------------------------------------------
 # Symbolic analysis: build q, pinv, etree, leftmost, vnz, rnz.
 # Implements Davis cs_sqr for QR with order = (passed in).
@@ -432,6 +312,44 @@ end
 
 # Default no-op AMD hook; overridden by the AMD.jl extension.
 _amd_colperm(rowptr, colval, m, n) = collect(1:n)
+
+# Fused (CSR pattern → CSC pattern of A(:, q)). Equivalent to
+# `_csr_pattern_to_csc` followed by `_permute_cols`, but skips materializing
+# the intermediate un-permuted CSC pattern. Returns (colptr_q, rowval_q).
+function _csr_pattern_to_csc_permuted(rowptr::Vector{Int}, colval::Vector{Int},
+                                       q::Vector{Int}, m::Int, n::Int)
+    nnz_total = length(colval)
+    # qinv: position k in q-order = the column j such that q[k] = j.
+    qinv = Vector{Int}(undef, n)
+    @inbounds for k in 1:n
+        qinv[q[k]] = k
+    end
+    # Per-column counts (in q-order).
+    colcounts = zeros(Int, n)
+    @inbounds for p in 1:nnz_total
+        colcounts[qinv[colval[p]]] += 1
+    end
+    colptr_q = Vector{Int}(undef, n + 1)
+    colptr_q[1] = 1
+    @inbounds for k in 1:n
+        colptr_q[k + 1] = colptr_q[k] + colcounts[k]
+    end
+    rowval_q = Vector{Int}(undef, nnz_total)
+    # Scatter row by row using the running counts in colcounts (reset to
+    # the column starts).
+    @inbounds for k in 1:n
+        colcounts[k] = colptr_q[k]
+    end
+    @inbounds for i in 1:m
+        r1 = rowptr[i]; r2 = rowptr[i + 1] - 1
+        for p in r1:r2
+            kc = qinv[colval[p]]
+            rowval_q[colcounts[kc]] = i
+            colcounts[kc] += 1
+        end
+    end
+    return colptr_q, rowval_q
+end
 
 function _build_symbolic(rowptr::Vector{Int}, colval::Vector{Int},
                           m::Int, n::Int, ordering::Symbol)
@@ -444,11 +362,9 @@ function _build_symbolic(rowptr::Vector{Int}, colval::Vector{Int},
         throw(ArgumentError("Unknown ordering :$ordering"))
     end
 
-    # 2) Build CSC pattern of A.
-    colptr_A, rowval_A = _csr_pattern_to_csc(rowptr, colval, m, n)
-
-    # 3) Build CSC pattern of A(:, q).
-    colptr_q, rowval_q = _permute_cols(colptr_A, rowval_A, q, m, n)
+    # 2+3) Build CSC pattern of A(:, q) in one pass: scatter row-by-row
+    # using the column-bucket counts of A(:, q).
+    colptr_q, rowval_q = _csr_pattern_to_csc_permuted(rowptr, colval, q, m, n)
 
     # 4) Etree of A(:, q)^T A(:, q).
     parent = _coletree_ata(colptr_q, rowval_q, m, n)
@@ -705,11 +621,10 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     tol_use = tol === nothing ? RT(eps(RT) * max(m, n)) * fro : RT(max(tol, 0))
     tol2 = tol_use * tol_use
 
-    # Value-aware repivot for numerically-zero columns.
+    # Value-aware repivot for numerically-zero columns. The returned sym
+    # always carries the same workspace (we pass sym.workspace through in
+    # the rebuild path), so `ws` stays valid.
     sym_use = _maybe_repivot_zero_cols_from_norms(ws.col_nrm2, sym, fro)
-    # Re-fetch workspace in case repivot replaced sym (it inherits the
-    # workspace, so this is the same buffer).
-    ws = _get_workspace(T, sym_use, nnz_A)::_CSRQRWorkspace{T, RT}
 
     # Apply row+column permutation S = (P A Q) into workspace buffers.
     _permute_pq!(ws, sym_use.pinv, sym_use.q, m, n)
@@ -877,8 +792,7 @@ end
 function _rebuild_symbolic_for_q(rowptr::Vector{Int}, colval::Vector{Int},
                                   m::Int, n::Int, q::Vector{Int})
     # Reuse _build_symbolic but force the q we've chosen.
-    colptr_A, rowval_A = _csr_pattern_to_csc(rowptr, colval, m, n)
-    colptr_q, rowval_q = _permute_cols(colptr_A, rowval_A, q, m, n)
+    colptr_q, rowval_q = _csr_pattern_to_csc_permuted(rowptr, colval, q, m, n)
     parent = _coletree_ata(colptr_q, rowval_q, m, n)
 
     leftmost_orig = zeros(Int, m)
