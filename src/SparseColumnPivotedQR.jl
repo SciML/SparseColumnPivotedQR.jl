@@ -1004,14 +1004,14 @@ function _apply_QH!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
         vc1 = Vp[k]; vc2 = Vp[k + 1] - 1
         vc2 < vc1 && continue
         tau = zero(T)
-        for vp in vc1:vc2
+        @simd for vp in vc1:vc2
             tau += conj(Vx[vp]) * work[Vi[vp]]
         end
         if tau == 0
             continue
         end
         tau_b = T(bk) * tau
-        for vp in vc1:vc2
+        @simd for vp in vc1:vc2
             work[Vi[vp]] -= tau_b * Vx[vp]
         end
     end
@@ -1027,14 +1027,14 @@ function _apply_Q!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
         vc1 = Vp[k]; vc2 = Vp[k + 1] - 1
         vc2 < vc1 && continue
         tau = zero(T)
-        for vp in vc1:vc2
+        @simd for vp in vc1:vc2
             tau += conj(Vx[vp]) * work[Vi[vp]]
         end
         if tau == 0
             continue
         end
         tau_b = T(bk) * tau
-        for vp in vc1:vc2
+        @simd for vp in vc1:vc2
             work[Vi[vp]] -= tau_b * Vx[vp]
         end
     end
