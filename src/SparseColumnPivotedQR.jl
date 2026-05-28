@@ -8,7 +8,7 @@ import LinearAlgebra: ldiv!, rank
 import Base: \, size, eltype
 
 export csr_qr, csr_analyze, csr_factor, csr_refactor!,
-       CSRQRSymbolic, CSRQRFactorization
+    CSRQRSymbolic, CSRQRFactorization
 
 # SparseMatricesCSR offset: rowptr stores 1-based if Bi == 1, 0-based if Bi == 0.
 @inline function getoffset(::SparseMatrixCSR{Bi}) where {Bi}
@@ -115,9 +115,11 @@ end
 # When `rowcap` is provided, allocate each row at the upper-bound capacity
 # directly (Vector{...}(undef, cap)) and shrink to the actual nnz via resize!.
 # This avoids a separate sizehint!() reallocation per row.
-function _csr_to_rows(A::SparseMatrixCSR{Bi, T},
-                     colperm_inv::Union{Nothing, Vector{Int}}=nothing,
-                     rowcap::Union{Nothing, Vector{Int}}=nothing) where {Bi, T}
+function _csr_to_rows(
+        A::SparseMatrixCSR{Bi, T},
+        colperm_inv::Union{Nothing, Vector{Int}} = nothing,
+        rowcap::Union{Nothing, Vector{Int}} = nothing
+    ) where {Bi, T}
     m, n = size(A)
     cols = Vector{Vector{Int}}(undef, m)
     vals = Vector{Vector{T}}(undef, m)
@@ -231,7 +233,7 @@ phase. Supported values:
 The numeric phase (`csr_factor`) is permitted to deviate from this initial
 ordering when a candidate column is rank-deficient (rank-revealing pivot).
 """
-function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:natural) where {Bi}
+function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol = :natural) where {Bi}
     m, n = size(A)
     rowptr, colval = _capture_pattern(A)
 
@@ -242,8 +244,10 @@ end
 
 # This is the pure-symbolic kernel; it does not depend on T or on A's
 # Bi parameter. Extensions (AMD.jl) hook in by overriding _amd_colperm.
-function _analyze_pattern(rowptr::Vector{Int}, colval::Vector{Int},
-                          m::Int, n::Int, ordering::Symbol)
+function _analyze_pattern(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        m::Int, n::Int, ordering::Symbol
+    )
     colperm = if ordering === :natural
         collect(1:n)
     elseif ordering === :amd || ordering === :colamd
@@ -351,9 +355,11 @@ end
 # "reach" of each row of A and add to the row counts of all ancestors along
 # the etree path. This is O(nnz(R)) and matches the standard cs_counts result
 # upper bound used by CXSparse for symbolic QR.
-function _row_counts(rowptr::Vector{Int}, colval::Vector{Int},
-                     parent::Vector{Int}, colptrc::Vector{Int}, rowidxc::Vector{Int},
-                     m::Int, n::Int)
+function _row_counts(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        parent::Vector{Int}, colptrc::Vector{Int}, rowidxc::Vector{Int},
+        m::Int, n::Int
+    )
     # We use a simple safe upper bound: for each row i of A, walk the columns
     # j ∈ A[i, :]; the row count of R[j, :] gets +1 for each unique row i in
     # the column j's reach. Concretely:
@@ -384,8 +390,10 @@ function _row_counts(rowptr::Vector{Int}, colval::Vector{Int},
 end
 
 # Compute per-row capacity hint. Mapped under the column permutation.
-function _row_capacity_hint(rowptr::Vector{Int}, colval::Vector{Int},
-                            m::Int, n::Int, colperm::Vector{Int})
+function _row_capacity_hint(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        m::Int, n::Int, colperm::Vector{Int}
+    )
     # Permute pattern columns first.
     if colperm == 1:n || (length(colperm) == n && all(colperm[i] == i for i in 1:n))
         colval_p = colval
@@ -431,8 +439,10 @@ column with largest residual norm is swapped in).
 If `tol === nothing`, the default tolerance `eps(real(T)) * max(m, n) * ||A||_F`
 is used (LAPACK `xgeqp3`-style).
 """
-function csr_factor(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
-                    tol::Union{Nothing, Real}=nothing) where {Bi, T}
+function csr_factor(
+        A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
+        tol::Union{Nothing, Real} = nothing
+    ) where {Bi, T}
     return _factor_kernel(A, sym, tol)
 end
 
@@ -442,10 +452,12 @@ end
 One-shot convenience: runs `csr_analyze` and `csr_factor` together. Equivalent to
 `csr_factor(A, csr_analyze(A; ordering); tol)`.
 """
-function csr_qr(A::SparseMatrixCSR{Bi, T}; tol::Union{Nothing, Real}=nothing,
-                ordering::Symbol=:natural) where {Bi, T}
-    sym = csr_analyze(A; ordering=ordering)
-    return csr_factor(A, sym; tol=tol)
+function csr_qr(
+        A::SparseMatrixCSR{Bi, T}; tol::Union{Nothing, Real} = nothing,
+        ordering::Symbol = :natural
+    ) where {Bi, T}
+    sym = csr_analyze(A; ordering = ordering)
+    return csr_factor(A, sym; tol = tol)
 end
 
 """
@@ -461,13 +473,15 @@ Note: this currently re-runs the full numeric factorization with the same
 AMD, capacity computation). Returns the resulting factorization (which may or
 may not alias `F` depending on whether allocation was reused).
 """
-function csr_refactor!(F::CSRQRFactorization{T},
-                       A::SparseMatrixCSR{Bi};
-                       tol::Union{Nothing, Real}=nothing) where {T, Bi}
+function csr_refactor!(
+        F::CSRQRFactorization{T},
+        A::SparseMatrixCSR{Bi};
+        tol::Union{Nothing, Real} = nothing
+    ) where {T, Bi}
     if _pattern_matches(F.sym, A)
         return _factor_kernel(A, F.sym, tol)
     else
-        sym = csr_analyze(A; ordering=F.sym.ordering)
+        sym = csr_analyze(A; ordering = F.sym.ordering)
         return _factor_kernel(A, sym, tol)
     end
 end
@@ -476,8 +490,10 @@ end
 # Numeric kernel (the original csr_qr loop, parameterized by Symbolic)
 # ---------------------------------------------------------------------------
 
-function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
-                        tol::Union{Nothing, Real}) where {Bi, T}
+function _factor_kernel(
+        A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
+        tol::Union{Nothing, Real}
+    ) where {Bi, T}
     m, n = size(A)
     (m == sym.m && n == sym.n) ||
         throw(DimensionMismatch("A is $m x $n but symbolic is $(sym.m) x $(sym.n)"))
@@ -492,7 +508,7 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
 
     Vstep_idx = Vector{Vector{Int}}()
     Vstep_val = Vector{Vector{T}}()
-    tau       = T[]
+    tau = T[]
 
     # `perm[k]` is the original column index of the column currently in position k.
     perm = copy(sym.colperm)
@@ -536,7 +552,7 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     # Stricter values reduce swaps but risk accepting weak pivots. The value below
     # is tuned for these workloads — small enough to avoid most cosmetic swaps,
     # large enough to still catch genuine rank deficiency in the recompute branch.
-    pivot_factor = RT(1e-6)
+    pivot_factor = RT(1.0e-6)
 
     for k in 1:kmax
         # --- Pivot column selection ---
@@ -912,8 +928,10 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
         col_nrm2[k] = zero(RT)
     end
 
-    return CSRQRFactorization{T, RT}(m, n, R_cols, R_vals, Vstep_idx, Vstep_val,
-                                     tau, perm, rnk, tol_use, sym)
+    return CSRQRFactorization{T, RT}(
+        m, n, R_cols, R_vals, Vstep_idx, Vstep_val,
+        tau, perm, rnk, tol_use, sym
+    )
 end
 
 # ---------------------------------------------------------------------------
