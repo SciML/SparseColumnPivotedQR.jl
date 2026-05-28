@@ -8,8 +8,8 @@ import LinearAlgebra: ldiv!, rank
 import Base: \, size, eltype
 
 export csr_qr, csr_analyze, csr_factor, csr_refactor!,
-       has_amd_extension,
-       CSRQRSymbolic, CSRQRFactorization
+    has_amd_extension,
+    CSRQRSymbolic, CSRQRFactorization
 
 # CSR offset: rowptr stores 1-based if Bi == 1, 0-based if Bi == 0.
 @inline function getoffset(::SparseMatrixCSR{Bi}) where {Bi}
@@ -39,9 +39,11 @@ end
 @inline function _alloc_csc(::Type{T}, m::Int, n::Int, nzmax::Int) where {T}
     # colptr left uninitialized; the caller sets colptr[1] = 1 and writes
     # colptr[k+1] at the end of each step.
-    return _CSCBuf{T}(m, n, Vector{Int}(undef, n + 1),
-                      Vector{Int}(undef, max(nzmax, 1)),
-                      Vector{T}(undef, max(nzmax, 1)))
+    return _CSCBuf{T}(
+        m, n, Vector{Int}(undef, n + 1),
+        Vector{Int}(undef, max(nzmax, 1)),
+        Vector{T}(undef, max(nzmax, 1))
+    )
 end
 
 @inline function _grow_csc!(B::_CSCBuf{T}, needed::Int) where {T}
@@ -150,8 +152,10 @@ function _csr_to_csc(A::SparseMatrixCSR{Bi, T}) where {Bi, T}
     return colptr, rowval, nzval, m, n
 end
 
-function _csr_pattern_to_csc(rowptr::Vector{Int}, colval::Vector{Int},
-                             m::Int, n::Int)
+function _csr_pattern_to_csc(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        m::Int, n::Int
+    )
     nnz_total = length(colval)
     colcounts = zeros(Int, n)
     @inbounds for p in 1:nnz_total
@@ -232,8 +236,10 @@ function _coletree_ata(colptr::Vector{Int}, rowval::Vector{Int}, m::Int, n::Int)
 end
 
 # Permute CSC pattern: output column k = input column q[k].
-function _permute_cols(colptr::Vector{Int}, rowval::Vector{Int},
-                       q::Vector{Int}, m::Int, n::Int)
+function _permute_cols(
+        colptr::Vector{Int}, rowval::Vector{Int},
+        q::Vector{Int}, m::Int, n::Int
+    )
     nnz_total = length(rowval)
     colptr_q = Vector{Int}(undef, n + 1)
     colptr_q[1] = 1
@@ -255,10 +261,12 @@ end
 
 # Apply both perms (P A Q): output col k = (PA)[:, q[k]]. Row i becomes pinv[i].
 # Also permutes nzval if provided.
-function _permute_pq(colptr::Vector{Int}, rowval::Vector{Int},
-                     nzval::Union{Nothing, Vector{T}},
-                     pinv::Vector{Int}, q::Vector{Int},
-                     m::Int, n::Int) where {T}
+function _permute_pq(
+        colptr::Vector{Int}, rowval::Vector{Int},
+        nzval::Union{Nothing, Vector{T}},
+        pinv::Vector{Int}, q::Vector{Int},
+        m::Int, n::Int
+    ) where {T}
     nnz_total = length(rowval)
     colptr_pq = Vector{Int}(undef, n + 1)
     colptr_pq[1] = 1
@@ -361,8 +369,10 @@ function _etree_total_depth(parent::Vector{Int})
     return total
 end
 
-function _build_symbolic(rowptr::Vector{Int}, colval::Vector{Int},
-                          m::Int, n::Int, ordering::Symbol)
+function _build_symbolic(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        m::Int, n::Int, ordering::Symbol
+    )
     # 1) Column permutation `q`.
     q = if ordering === :natural
         collect(1:n)
@@ -484,8 +494,10 @@ function _build_symbolic(rowptr::Vector{Int}, colval::Vector{Int},
     end
 
     # 8) Compute exact / upper-bound vnz, rnz.
-    vnz, rnz = _vnz_rnz_estimate(colptr_q, rowval_q, parent,
-                                  leftmost_orig, m, n)
+    vnz, rnz = _vnz_rnz_estimate(
+        colptr_q, rowval_q, parent,
+        leftmost_orig, m, n
+    )
 
     # Return original-row leftmost too? No; we only need the permuted one
     # during the numeric phase. We return the permuted one.
@@ -494,10 +506,12 @@ end
 
 # Upper-bound estimate of nnz(V) and nnz(R), used to pre-size CSC buffers.
 # Tightens iteratively if exceeded by `_grow_csc!`.
-function _vnz_rnz_estimate(colptr::Vector{Int}, rowval::Vector{Int},
-                            parent::Vector{Int},
-                            leftmost_orig::Vector{Int},
-                            m::Int, n::Int)
+function _vnz_rnz_estimate(
+        colptr::Vector{Int}, rowval::Vector{Int},
+        parent::Vector{Int},
+        leftmost_orig::Vector{Int},
+        m::Int, n::Int
+    )
     # rnz: for each column k of S, run ereach to count R[:,k] pattern entries
     # (excluding diagonal). We use a *cheap* upper-bound: for each column k,
     # the number of R entries is at most k itself (full upper triangle), but
@@ -551,15 +565,19 @@ the V (Householder) and R buffers.
 Returns a `CSRQRSymbolic` that can be passed to `csr_factor` and reused via
 `csr_refactor!` for matrices with identical sparsity patterns.
 """
-function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:default) where {Bi}
+function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol = :default) where {Bi}
     m, n = size(A)
     rowptr, colval = _capture_pattern(A)
     ordering_use = _resolve_ordering(ordering)
-    if (ordering_use === :amd || ordering_use === :colamd ||
-        ordering_use === :adaptive) && !_AMD_EXT_LOADED[]
-        throw(ArgumentError(
-            "ordering=:$ordering_use requires the AMD.jl extension; load it via `using AMD`"
-        ))
+    if (
+            ordering_use === :amd || ordering_use === :colamd ||
+                ordering_use === :adaptive
+        ) && !_AMD_EXT_LOADED[]
+        throw(
+            ArgumentError(
+                "ordering=:$ordering_use requires the AMD.jl extension; load it via `using AMD`"
+            )
+        )
     end
 
     if ordering_use === :adaptive
@@ -576,20 +594,26 @@ function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:default) where {B
         # Tiebreaker prefers :natural: cheaper symbolic, and on shallow
         # etrees the apply-step difference is in the noise.
         if d_a < d_n
-            return CSRQRSymbolic(m, n, m2_a, q_a, pinv_a, parent_a,
-                                  leftmost_a, vnz_a, rnz_a, :amd,
-                                  rowptr, colval)
+            return CSRQRSymbolic(
+                m, n, m2_a, q_a, pinv_a, parent_a,
+                leftmost_a, vnz_a, rnz_a, :amd,
+                rowptr, colval
+            )
         else
-            return CSRQRSymbolic(m, n, m2_n, q_n, pinv_n, parent_n,
-                                  leftmost_n, vnz_n, rnz_n, :natural,
-                                  rowptr, colval)
+            return CSRQRSymbolic(
+                m, n, m2_n, q_n, pinv_n, parent_n,
+                leftmost_n, vnz_n, rnz_n, :natural,
+                rowptr, colval
+            )
         end
     end
 
     q, pinv, parent, leftmost_perm, m2, vnz, rnz =
         _build_symbolic(rowptr, colval, m, n, ordering_use)
-    return CSRQRSymbolic(m, n, m2, q, pinv, parent, leftmost_perm,
-                          vnz, rnz, ordering_use, rowptr, colval)
+    return CSRQRSymbolic(
+        m, n, m2, q, pinv, parent, leftmost_perm,
+        vnz, rnz, ordering_use, rowptr, colval
+    )
 end
 
 """
@@ -613,9 +637,11 @@ grows with `drop_tol`) but subsequent `apply_QH` / `apply_Q` over fewer
 nonzeros becomes cheaper. Typical safe values are `1e-12` to `1e-8` —
 larger values trade accuracy for fill.
 """
-function csr_factor(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
-                    tol::Union{Nothing, Real}=nothing,
-                    drop_tol::Real=0) where {Bi, T}
+function csr_factor(
+        A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
+        tol::Union{Nothing, Real} = nothing,
+        drop_tol::Real = 0
+    ) where {Bi, T}
     return _factor_kernel(A, sym, tol, real(T)(drop_tol))
 end
 
@@ -630,12 +656,14 @@ typical dense-fill matrices that arise from nonlinear solver linsolves,
 `:amd` roughly halves the factor time. Pass `ordering=:natural` to opt out
 for matrices whose columns are already well-ordered.
 """
-function csr_qr(A::SparseMatrixCSR{Bi, T};
-                tol::Union{Nothing, Real}=nothing,
-                ordering::Symbol=:default,
-                drop_tol::Real=0) where {Bi, T}
-    sym = csr_analyze(A; ordering=ordering)
-    return csr_factor(A, sym; tol=tol, drop_tol=drop_tol)
+function csr_qr(
+        A::SparseMatrixCSR{Bi, T};
+        tol::Union{Nothing, Real} = nothing,
+        ordering::Symbol = :default,
+        drop_tol::Real = 0
+    ) where {Bi, T}
+    sym = csr_analyze(A; ordering = ordering)
+    return csr_factor(A, sym; tol = tol, drop_tol = drop_tol)
 end
 
 """
@@ -649,15 +677,17 @@ The `drop_tol` keyword has the same meaning as in [`csr_factor`](@ref).
 
 Returns a fresh `CSRQRFactorization` (the original is unchanged).
 """
-function csr_refactor!(F::CSRQRFactorization{T},
-                       A::SparseMatrixCSR{Bi};
-                       tol::Union{Nothing, Real}=nothing,
-                       drop_tol::Real=0) where {T, Bi}
+function csr_refactor!(
+        F::CSRQRFactorization{T},
+        A::SparseMatrixCSR{Bi};
+        tol::Union{Nothing, Real} = nothing,
+        drop_tol::Real = 0
+    ) where {T, Bi}
     dt = real(T)(drop_tol)
     if _pattern_matches(F.sym, A)
         return _factor_kernel(A, F.sym, tol, dt)
     else
-        sym = csr_analyze(A; ordering=F.sym.ordering)
+        sym = csr_analyze(A; ordering = F.sym.ordering)
         return _factor_kernel(A, sym, tol, dt)
     end
 end
@@ -666,9 +696,11 @@ end
 # Numeric kernel — Davis cs_qr on the row+column permuted matrix S = P A Q.
 # ---------------------------------------------------------------------------
 
-function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
-                         tol::Union{Nothing, Real},
-                         drop_tol::Real=zero(real(T))) where {Bi, T}
+function _factor_kernel(
+        A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
+        tol::Union{Nothing, Real},
+        drop_tol::Real = zero(real(T))
+    ) where {Bi, T}
     m, n = size(A)
     (m == sym.m && n == sym.n) ||
         throw(DimensionMismatch("A is $m x $n but symbolic is $(sym.m) x $(sym.n)"))
@@ -697,8 +729,10 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     colptr_S, rowval_S, nzval_S =
         _permute_pq(colptr_A, rowval_A, nzval_A, sym_use.pinv, sym_use.q, m, n)
 
-    return _csc_qr_numeric(colptr_S, rowval_S, nzval_S, sym_use,
-                           tol_use, tol2, RT(drop_tol))
+    return _csc_qr_numeric(
+        colptr_S, rowval_S, nzval_S, sym_use,
+        tol_use, tol2, RT(drop_tol)
+    )
 end
 
 # CSR -> CSC of A, plus per-column squared norms and total ||A||_F^2. The
@@ -750,9 +784,11 @@ end
 # the value-independent symbolic pieces (parent, leftmost, m2, pinv, vnz, rnz)
 # for the new ordering. Returns either the original `sym` (no zero columns)
 # or a freshly-built one.
-function _maybe_repivot_zero_cols_from_norms(col_norms::Vector{RT},
-                                              sym::CSRQRSymbolic,
-                                              fro_A::Real) where {RT}
+function _maybe_repivot_zero_cols_from_norms(
+        col_norms::Vector{RT},
+        sym::CSRQRSymbolic,
+        fro_A::Real
+    ) where {RT}
     n = sym.n
     eps_zero = RT(fro_A) * RT(eps(RT)) * RT(max(sym.m, n))
     thr2 = eps_zero * eps_zero
@@ -790,16 +826,22 @@ function _maybe_repivot_zero_cols_from_norms(col_norms::Vector{RT},
 
     # Rebuild symbolic with the new q'.
     q2, pinv2, parent2, leftmost2, m2_2, vnz2, rnz2 =
-        _rebuild_symbolic_for_q(sym.pattern_rowptr, sym.pattern_colval,
-                                 sym.m, sym.n, q_new)
-    return CSRQRSymbolic(sym.m, sym.n, m2_2, q2, pinv2, parent2, leftmost2,
-                         vnz2, rnz2, sym.ordering, sym.pattern_rowptr,
-                         sym.pattern_colval)
+        _rebuild_symbolic_for_q(
+        sym.pattern_rowptr, sym.pattern_colval,
+        sym.m, sym.n, q_new
+    )
+    return CSRQRSymbolic(
+        sym.m, sym.n, m2_2, q2, pinv2, parent2, leftmost2,
+        vnz2, rnz2, sym.ordering, sym.pattern_rowptr,
+        sym.pattern_colval
+    )
 end
 
 # Rebuild symbolic data for a given q (a column permutation).
-function _rebuild_symbolic_for_q(rowptr::Vector{Int}, colval::Vector{Int},
-                                  m::Int, n::Int, q::Vector{Int})
+function _rebuild_symbolic_for_q(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        m::Int, n::Int, q::Vector{Int}
+    )
     # Reuse _build_symbolic but force the q we've chosen.
     colptr_A, rowval_A = _csr_pattern_to_csc(rowptr, colval, m, n)
     colptr_q, rowval_q = _permute_cols(colptr_A, rowval_A, q, m, n)
@@ -884,16 +926,20 @@ function _rebuild_symbolic_for_q(rowptr::Vector{Int}, colval::Vector{Int},
         end
     end
 
-    vnz, rnz = _vnz_rnz_estimate(colptr_q, rowval_q, parent, leftmost_orig,
-                                  m, n)
+    vnz, rnz = _vnz_rnz_estimate(
+        colptr_q, rowval_q, parent, leftmost_orig,
+        m, n
+    )
     return q, pinv, parent, leftmost_perm, m2, vnz, rnz
 end
 
 # Numeric loop. Returns a CSRQRFactorization.
-function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
-                         nzval::Vector{T}, sym::CSRQRSymbolic,
-                         tol_use::RT, tol2::RT,
-                         drop_tol::RT=zero(RT)) where {T, RT}
+function _csc_qr_numeric(
+        colptr::Vector{Int}, rowval::Vector{Int},
+        nzval::Vector{T}, sym::CSRQRSymbolic,
+        tol_use::RT, tol2::RT,
+        drop_tol::RT = zero(RT)
+    ) where {T, RT}
     drop_active = drop_tol > zero(RT)
     drop_tol2 = drop_tol * drop_tol
     m, n, m2 = sym.m, sym.n, sym.m2
@@ -1122,10 +1168,12 @@ function _csc_qr_numeric(colptr::Vector{Int}, rowval::Vector{Int},
     resize!(Vi, vnz_total); resize!(Vx, vnz_total)
     resize!(Ri, rnz_total); resize!(Rx, rnz_total)
 
-    return CSRQRFactorization{T, RT}(sym.m, sym.n,
+    return CSRQRFactorization{T, RT}(
+        sym.m, sym.n,
         Vp, Vi, Vx,
         Rp, Ri, Rx,
-        beta, rnk, tol_use, sym)
+        beta, rnk, tol_use, sym
+    )
 end
 
 # ---------------------------------------------------------------------------
@@ -1187,8 +1235,10 @@ end
 
 # Solve R z = c (R is upper triangular in CSC). Rank-revealing: rows
 # (k+1..n) of z are zeroed if R[k,k] is below threshold.
-function _usolve!(z::AbstractVector{T}, F::CSRQRFactorization{T},
-                   c::AbstractVector{T}) where {T}
+function _usolve!(
+        z::AbstractVector{T}, F::CSRQRFactorization{T},
+        c::AbstractVector{T}
+    ) where {T}
     n = F.n
     Rp = F.R_colptr; Ri = F.R_rowval; Rx = F.R_nzval
     tol_use = F.tol
@@ -1241,8 +1291,10 @@ function _usolve!(z::AbstractVector{T}, F::CSRQRFactorization{T},
     return z
 end
 
-function LinearAlgebra.ldiv!(x::AbstractVector{T}, F::CSRQRFactorization{T},
-                              b::AbstractVector{T}) where {T}
+function LinearAlgebra.ldiv!(
+        x::AbstractVector{T}, F::CSRQRFactorization{T},
+        b::AbstractVector{T}
+    ) where {T}
     length(b) == F.m || throw(DimensionMismatch("b length $(length(b)) != m=$(F.m)"))
     length(x) == F.n || throw(DimensionMismatch("x length $(length(x)) != n=$(F.n)"))
     m, n, m2 = F.m, F.n, F.sym.m2

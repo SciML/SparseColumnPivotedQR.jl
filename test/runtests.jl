@@ -24,19 +24,19 @@ end
         F = csr_qr(Acsr)
         @test rank(F) == n
         x = F \ b
-        @test x ≈ b atol=1e-12
+        @test x ≈ b atol = 1.0e-12
     end
 
     @testset "Small dense-ish random sparse (square, full rank)" begin
         Random.seed!(1)
         n = 30
-        A = sprand(Float64, n, n, 0.3) + 5*I
+        A = sprand(Float64, n, n, 0.3) + 5 * I
         Acsr = build_csr(Matrix(A))
         b = randn(n)
         F = csr_qr(Acsr)
         @test rank(F) == n
         x = F \ b
-        @test norm(A * x - b) / norm(b) < 1e-10
+        @test norm(A * x - b) / norm(b) < 1.0e-10
     end
 
     @testset "Tall least-squares (overdetermined, full column rank)" begin
@@ -50,7 +50,7 @@ end
         x = F \ b
         # Compare to dense LS
         xref = Adense \ b
-        @test norm(x - xref) / max(norm(xref), 1.0) < 1e-10
+        @test norm(x - xref) / max(norm(xref), 1.0) < 1.0e-10
     end
 
     @testset "Rank-deficient overdetermined" begin
@@ -60,14 +60,14 @@ end
         Adense = U * V'
         Acsr = build_csr(Adense)
         b = randn(6)
-        F = csr_qr(Acsr; tol=1e-10)
+        F = csr_qr(Acsr; tol = 1.0e-10)
         @test rank(F) == 3
         x = F \ b
         # Compare residual to SVD-pinv (any LS solution gives same residual)
         xref = pinv(Adense) * b
         rres = Adense * x - b
         rref = Adense * xref - b
-        @test norm(rres) ≈ norm(rref) atol=1e-8
+        @test norm(rres) ≈ norm(rref) atol = 1.0e-8
         @test all(isfinite, x)
     end
 
@@ -81,7 +81,7 @@ end
         @test rank(F) == n - 1
         x = F \ b
         @test all(isfinite, x)
-        @test norm(A * x - b) < 1e-10
+        @test norm(A * x - b) < 1.0e-10
     end
 
     @testset "Rank-deficient square (199x199 user matrix simulated)" begin
@@ -97,7 +97,7 @@ end
         x = F \ b
         @test all(isfinite, x)
         # residual should be near zero
-        @test norm(Adense * x - b) / max(norm(b), 1.0) < 1e-8
+        @test norm(Adense * x - b) / max(norm(b), 1.0) < 1.0e-8
     end
 
     @testset "Bundled 199x199 matrices (mix of rank-deficient)" begin
@@ -108,13 +108,13 @@ end
         files = sort(
             filter(
                 f -> endswith(f, ".txt"),
-                readdir(dir; join=true)
+                readdir(dir; join = true)
             )
         )
         @test !isempty(files)
         for f in files
             text = read(f, String)
-            lines = split(text, '\n'; keepempty=false)
+            lines = split(text, '\n'; keepempty = false)
             A = eval(Meta.parse(strip(lines[1])))
             b = eval(Meta.parse(strip(lines[2])))
             Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
@@ -129,12 +129,12 @@ end
                 rspqr = norm(A * xspqr - b)
                 # Either both are essentially zero (full-rank well-conditioned),
                 # or the LS residual matches SPQR's basic solver.
-                scale = max(rspqr, 1e-12 * norm(b))
-                @test rmy <= 1e-8 + 2 * scale
+                scale = max(rspqr, 1.0e-12 * norm(b))
+                @test rmy <= 1.0e-8 + 2 * scale
             else
                 # NaN in b: x should be all NaN (or non-finite); matches SPQR.
                 @test count(!isfinite, x) == count(!isfinite, xspqr) ||
-                      count(!isfinite, x) > 0
+                    count(!isfinite, x) > 0
             end
         end
     end
@@ -148,7 +148,7 @@ end
         F = csr_qr(Acsr)
         @test rank(F) == n
         x = F \ b
-        @test norm(Adense * x - b) / norm(b) < 1e-10
+        @test norm(Adense * x - b) / norm(b) < 1.0e-10
     end
 
     @testset "analyze + factor split" begin
@@ -158,18 +158,18 @@ end
         Acsr = build_csr(Matrix(A))
         b = randn(n)
 
-        sym = csr_analyze(Acsr; ordering=:natural)
+        sym = csr_analyze(Acsr; ordering = :natural)
         @test size(sym) == (n, n)
         F = csr_factor(Acsr, sym)
         x = F \ b
         @test rank(F) == n
-        @test norm(A * x - b) / norm(b) < 1e-10
+        @test norm(A * x - b) / norm(b) < 1.0e-10
 
         # csr_qr matches csr_factor(csr_analyze)
-        F2 = csr_qr(Acsr; ordering=:natural)
+        F2 = csr_qr(Acsr; ordering = :natural)
         x2 = F2 \ b
         @test rank(F2) == n
-        @test norm(x - x2) / max(norm(x), 1.0) < 1e-12
+        @test norm(x - x2) / max(norm(x), 1.0) < 1.0e-12
     end
 
     @testset "AMD ordering" begin
@@ -179,9 +179,9 @@ end
         Acsr = build_csr(Matrix(A))
         b = randn(n)
 
-        sym_nat = csr_analyze(Acsr; ordering=:natural)
-        sym_amd = csr_analyze(Acsr; ordering=:amd)
-        sym_col = csr_analyze(Acsr; ordering=:colamd)
+        sym_nat = csr_analyze(Acsr; ordering = :natural)
+        sym_amd = csr_analyze(Acsr; ordering = :amd)
+        sym_col = csr_analyze(Acsr; ordering = :colamd)
 
         # AMD should produce a non-identity permutation on a random matrix
         @test sym_amd.q != 1:n
@@ -193,8 +193,8 @@ end
 
         @test rank(F_nat) == n
         @test rank(F_amd) == n
-        @test norm(A * x_nat - b) / norm(b) < 1e-10
-        @test norm(A * x_amd - b) / norm(b) < 1e-10
+        @test norm(A * x_nat - b) / norm(b) < 1.0e-10
+        @test norm(A * x_amd - b) / norm(b) < 1.0e-10
 
         # AMD should not blow up fill: total nnz(R) <= natural's by a reasonable factor
         nnz_nat = length(F_nat.R_nzval)
@@ -219,24 +219,24 @@ end
 
         F1 = csr_qr(Acsr1)
         x1 = F1 \ b
-        @test norm(A1 * x1 - b) / norm(b) < 1e-10
+        @test norm(A1 * x1 - b) / norm(b) < 1.0e-10
 
         # Refactor with same pattern, different values
         F2 = csr_refactor!(F1, Acsr2)
         x2 = F2 \ b
-        @test norm(A2 * x2 - b) / norm(b) < 1e-10
+        @test norm(A2 * x2 - b) / norm(b) < 1.0e-10
 
         # Compare against fresh factor
         F2_fresh = csr_qr(Acsr2)
         x2_fresh = F2_fresh \ b
-        @test norm(x2 - x2_fresh) / max(norm(x2_fresh), 1.0) < 1e-10
+        @test norm(x2 - x2_fresh) / max(norm(x2_fresh), 1.0) < 1.0e-10
 
         # Refactor with a different pattern triggers full analyze+factor
         A3 = sprand(Float64, n, n, 0.3) + 4 * sparse(I, n, n)
         Acsr3 = build_csr(Matrix(A3))
         F3 = csr_refactor!(F1, Acsr3)
         x3 = F3 \ b
-        @test norm(A3 * x3 - b) / norm(b) < 1e-10
+        @test norm(A3 * x3 - b) / norm(b) < 1.0e-10
     end
 
     @testset "default ordering resolves to :amd when AMD is loaded" begin
@@ -309,13 +309,13 @@ end
         A = sprand(Float64, n, n, 0.3) + 3 * sparse(I, n, n)
         Acsr = build_csr(Matrix(A))
         b = randn(n)
-        F_nat = csr_qr(Acsr; ordering=:natural)
-        F_amd = csr_qr(Acsr; ordering=:amd)
+        F_nat = csr_qr(Acsr; ordering = :natural)
+        F_amd = csr_qr(Acsr; ordering = :amd)
         # Same solution to LS tolerance
         x_nat = F_nat \ b
         x_amd = F_amd \ b
-        @test norm(A * x_nat - b) / norm(b) < 1e-10
-        @test norm(A * x_amd - b) / norm(b) < 1e-10
+        @test norm(A * x_nat - b) / norm(b) < 1.0e-10
+        @test norm(A * x_amd - b) / norm(b) < 1.0e-10
         @test rank(F_nat) == rank(F_amd) == n
     end
 
@@ -324,7 +324,7 @@ end
         n = 25
         A = randn(n, n) + 4 * I
         Acsr = build_csr(A)
-        F = csr_qr(Acsr; ordering=:natural)
+        F = csr_qr(Acsr; ordering = :natural)
         # Reconstruct R as a dense matrix.
         R = zeros(n, n)
         for k in 1:n
@@ -352,7 +352,7 @@ end
             v = V[:, k]
             Q = (Matrix{Float64}(I, m2, m2) - F.beta[k] * v * transpose(v)) * Q
         end
-        @test norm(transpose(Q) * Q - I) < 1e-10
+        @test norm(transpose(Q) * Q - I) < 1.0e-10
         # Reconstruct P A Q (column-permuted): row i of A maps to slot pinv[i],
         # col j of A appears at q-position invq[j].
         P = zeros(m2, n)
@@ -362,7 +362,7 @@ end
         PAq = P * A[:, F.sym.q]
         # Q * [R; 0] should equal P A Q.
         R_ext = vcat(R, zeros(m2 - n, n))
-        @test norm(Q * R_ext - PAq) < 1e-10
+        @test norm(Q * R_ext - PAq) < 1.0e-10
     end
 
     @testset "adaptive ordering picks the shallower etree" begin
@@ -447,7 +447,7 @@ end
         @test all(isfinite, x)
         Fs = qr(sparse(A))
         xs = Fs \ b
-        @test norm(A * x - b) ≈ norm(A * xs - b) atol=1e-8
+        @test norm(A * x - b) ≈ norm(A * xs - b) atol = 1.0e-8
     end
 
 end

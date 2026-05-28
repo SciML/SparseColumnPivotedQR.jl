@@ -1,8 +1,11 @@
-Manifest.toml
 *.jl.cov
 *.jl.*.cov
 *.jl.mem
+
+Manifest.toml
 deps/deps.jl
+docs/build/
+docs/site/
 .DS_Store
 docs/build/
 docs/site/
