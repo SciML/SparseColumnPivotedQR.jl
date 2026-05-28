@@ -8,7 +8,8 @@ import LinearAlgebra: ldiv!, rank
 import Base: \, size, eltype
 
 export csr_qr, csr_analyze, csr_factor, csr_refactor!,
-       CSRQRSymbolic, CSRQRFactorization
+    has_amd_extension,
+    CSRQRSymbolic, CSRQRFactorization
 
 # CSR offset: rowptr stores 1-based if Bi == 1, 0-based if Bi == 0.
 @inline function getoffset(::SparseMatrixCSR{Bi}) where {Bi}
@@ -18,8 +19,10 @@ end
 # Grow a (rowval, nzval) pair so that both have at least `needed` capacity.
 # Used by the numeric kernel to expand V/R output buffers if the symbolic
 # bound was undershot.
-@inline function _grow_pair!(rowval::Vector{Int}, nzval::Vector{T},
-                              needed::Int) where {T}
+@inline function _grow_pair!(
+        rowval::Vector{Int}, nzval::Vector{T},
+        needed::Int
+    ) where {T}
     L = length(rowval)
     new_L = max(2 * L, needed)
     resize!(rowval, new_L)
@@ -80,8 +83,10 @@ mutable struct _CSRQRWorkspace{T, RT}
     wgen::Int
 end
 
-function _alloc_workspace(::Type{T}, m::Int, n::Int, m2::Int,
-                          nnz_A::Int) where {T}
+function _alloc_workspace(
+        ::Type{T}, m::Int, n::Int, m2::Int,
+        nnz_A::Int
+    ) where {T}
     RT = real(T)
     return _CSRQRWorkspace{T, RT}(
         Vector{Int}(undef, n + 1),
@@ -213,9 +218,11 @@ end
 # Peyton union-find one (which is O(nnz·α) but more intricate for QR).
 # For the matrix sizes typical in this package (n ~ 200, nnz ~ 1000), the
 # ereach formulation is both simpler and competitive.
-function _cs_counts(colptr::Vector{Int}, rowval::Vector{Int},
-                    parent::Vector{Int}, leftmost::Vector{Int},
-                    m::Int, n::Int)
+function _cs_counts(
+        colptr::Vector{Int}, rowval::Vector{Int},
+        parent::Vector{Int}, leftmost::Vector{Int},
+        m::Int, n::Int
+    )
     colcount = zeros(Int, n)
     stamp = zeros(Int, n)         # stamp[j] == k means j is in column-k pattern
     @inbounds for k in 1:n
@@ -277,11 +284,74 @@ end
 # Default no-op AMD hook; overridden by the AMD.jl extension.
 _amd_colperm(rowptr, colval, m, n) = collect(1:n)
 
+# Set to `true` by the AMD.jl extension on `__init__`. Lets `csr_analyze` /
+# `csr_qr` resolve the default ordering (`:default`) to `:amd` only when the
+# extension is actually loaded, falling back to `:natural` otherwise. Using a
+# Ref so it can be flipped from the extension at load time.
+const _AMD_EXT_LOADED = Ref(false)
+
+"""
+    has_amd_extension() -> Bool
+
+Returns `true` iff the `AMD.jl` extension has been loaded into the current
+session (i.e. `using AMD` has been executed). The default ordering
+`:default` resolves to `:amd` only when this is `true`, falling back to
+`:natural` otherwise.
+"""
+has_amd_extension() = _AMD_EXT_LOADED[]
+
+# Resolve `:default` to `:amd` when the AMD extension is loaded, `:natural`
+# otherwise. All other symbols pass through.
+@inline function _resolve_ordering(ordering::Symbol)
+    if ordering === :default
+        return _AMD_EXT_LOADED[] ? :amd : :natural
+    end
+    return ordering
+end
+
+# Cheap fill estimator: total depth of the column elimination tree (sum
+# over k of distance from k to root). Mirrors what the apply step pays —
+# deeper chain → more Householders touched per column. O(n) thanks to
+# the bottom-up recursion using a `depth` cache.
+function _etree_total_depth(parent::Vector{Int})
+    n = length(parent)
+    depth = zeros(Int, n)
+    total = 0
+    @inbounds for k in 1:n
+        # parent[k] is always > k (etree of column k has children with
+        # smaller indices). Walk up; cache depths so each node is touched
+        # once. Equivalent to the recursive depth function with memoisation.
+        if depth[k] == 0
+            # depth from k to root, computed via iteration with stack-free
+            # caching: walk to a node whose depth is known, then assign
+            # depths back along the path.
+            j = k
+            len = 0
+            while j != 0 && depth[j] == 0
+                len += 1
+                j = parent[j]
+            end
+            base = j == 0 ? 0 : depth[j]
+            j = k
+            d = base + len
+            while j != 0 && depth[j] == 0
+                depth[j] = d
+                d -= 1
+                j = parent[j]
+            end
+        end
+        total += depth[k]
+    end
+    return total
+end
+
 # Fused (CSR pattern → CSC pattern of A(:, q)). Equivalent to
 # `_csr_pattern_to_csc` followed by `_permute_cols`, but skips materializing
 # the intermediate un-permuted CSC pattern. Returns (colptr_q, rowval_q).
-function _csr_pattern_to_csc_permuted(rowptr::Vector{Int}, colval::Vector{Int},
-                                       q::Vector{Int}, m::Int, n::Int)
+function _csr_pattern_to_csc_permuted(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        q::Vector{Int}, m::Int, n::Int
+    )
     nnz_total = length(colval)
     # qinv: position k in q-order = the column j such that q[k] = j.
     qinv = Vector{Int}(undef, n)
@@ -315,8 +385,10 @@ function _csr_pattern_to_csc_permuted(rowptr::Vector{Int}, colval::Vector{Int},
     return colptr_q, rowval_q
 end
 
-function _build_symbolic(rowptr::Vector{Int}, colval::Vector{Int},
-                          m::Int, n::Int, ordering::Symbol)
+function _build_symbolic(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        m::Int, n::Int, ordering::Symbol
+    )
     # 1) Column permutation `q`.
     q = if ordering === :natural
         collect(1:n)
@@ -466,7 +538,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    csr_analyze(A::SparseMatrixCSR; ordering=:natural) -> CSRQRSymbolic
+    csr_analyze(A::SparseMatrixCSR; ordering=:default) -> CSRQRSymbolic
 
 Symbolic analysis phase for the sparse column-pivoted Householder QR
 factorization. Computes the column permutation `q`, row permutation `pinv`,
@@ -474,24 +546,75 @@ column elimination tree, per-row `leftmost`, and the upper-bound sizes of
 the V (Householder) and R buffers.
 
 `ordering` selects the column ordering:
-  * `:natural` — identity ordering (default; best on dense-fill matrices).
-  * `:amd`     — AMD on AᵀA (requires `using AMD` to enable the extension).
-  * `:colamd`  — alias for `:amd`.
+  * `:default`  — `:amd` if the AMD.jl extension is loaded (`using AMD`),
+                  `:natural` otherwise. **This is the default.**
+  * `:natural`  — identity ordering (opt-in; usually slower than `:amd` on
+                  dense-fill matrices because the column etree degenerates
+                  to a chain).
+  * `:amd`      — AMD on AᵀA (requires `using AMD` to enable the extension;
+                  throws an `ArgumentError` otherwise).
+  * `:colamd`   — alias for `:amd`.
+  * `:adaptive` — compute both `:amd` and `:natural` symbolics, pick the
+                  one with the smaller column-etree total depth (which
+                  bounds total apply work). Requires AMD; ~140 µs extra
+                  symbolic overhead vs `:amd` alone.
 
 Returns a `CSRQRSymbolic` that can be passed to `csr_factor` and reused via
 `csr_refactor!` for matrices with identical sparsity patterns.
 """
-function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol=:natural) where {Bi}
+function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol = :default) where {Bi}
     m, n = size(A)
     rowptr, colval = _capture_pattern(A)
+    ordering_use = _resolve_ordering(ordering)
+    if (
+            ordering_use === :amd || ordering_use === :colamd ||
+                ordering_use === :adaptive
+        ) && !_AMD_EXT_LOADED[]
+        throw(
+            ArgumentError(
+                "ordering=:$ordering_use requires the AMD.jl extension; load it via `using AMD`"
+            )
+        )
+    end
+
+    if ordering_use === :adaptive
+        # Build both candidate symbolics, compare predicted apply work via
+        # the column-etree total depth, keep the cheaper one. AMD's etree
+        # is branched and typically shallower; on already-well-ordered
+        # matrices natural can win and we fall back to it.
+        q_a, pinv_a, parent_a, leftmost_a, m2_a, vnz_a, rnz_a, rcount_a =
+            _build_symbolic(rowptr, colval, m, n, :amd)
+        q_n, pinv_n, parent_n, leftmost_n, m2_n, vnz_n, rnz_n, rcount_n =
+            _build_symbolic(rowptr, colval, m, n, :natural)
+        d_a = _etree_total_depth(parent_a)
+        d_n = _etree_total_depth(parent_n)
+        # Tiebreaker prefers :natural: cheaper symbolic, and on shallow
+        # etrees the apply-step difference is in the noise.
+        if d_a < d_n
+            return CSRQRSymbolic(
+                m, n, m2_a, q_a, pinv_a, parent_a,
+                leftmost_a, vnz_a, rnz_a, rcount_a, :amd,
+                rowptr, colval, nothing
+            )
+        else
+            return CSRQRSymbolic(
+                m, n, m2_n, q_n, pinv_n, parent_n,
+                leftmost_n, vnz_n, rnz_n, rcount_n, :natural,
+                rowptr, colval, nothing
+            )
+        end
+    end
+
     q, pinv, parent, leftmost_perm, m2, vnz, rnz, rcount =
-        _build_symbolic(rowptr, colval, m, n, ordering)
-    return CSRQRSymbolic(m, n, m2, q, pinv, parent, leftmost_perm,
-                          vnz, rnz, rcount, ordering, rowptr, colval, nothing)
+        _build_symbolic(rowptr, colval, m, n, ordering_use)
+    return CSRQRSymbolic(
+        m, n, m2, q, pinv, parent, leftmost_perm,
+        vnz, rnz, rcount, ordering_use, rowptr, colval, nothing
+    )
 end
 
 """
-    csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing) -> CSRQRFactorization
+    csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing, drop_tol=0) -> CSRQRFactorization
 
 Numeric factorization given a `CSRQRSymbolic`. Implements the Davis
 `cs_qr` algorithm (scatter–apply–emit on a dense workspace) with the V/R
@@ -502,26 +625,46 @@ Columns whose post-Householder diagonal magnitude falls below `tol` are
 flagged as rank-deficient: `V[:,k] = 0`, `β_k = 0`, `R[k,k] = 0`. The
 numerical rank is the count of columns whose diagonal magnitude is above
 threshold.
+
+`drop_tol=0` (default) keeps every nonzero in each Householder vector
+`V[:, k]`. Setting `drop_tol > 0` discards entries with
+`|v_i| <= drop_tol * ‖v‖` and recomputes `β_k` for the truncated vector;
+the resulting factorization is an *approximate* QR (residual `‖A x - b‖`
+grows with `drop_tol`) but subsequent `apply_QH` / `apply_Q` over fewer
+nonzeros becomes cheaper. Typical safe values are `1e-12` to `1e-8` —
+larger values trade accuracy for fill.
 """
-function csr_factor(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
-                    tol::Union{Nothing, Real}=nothing) where {Bi, T}
-    return _factor_kernel(A, sym, tol, nothing)
+function csr_factor(
+        A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
+        tol::Union{Nothing, Real} = nothing,
+        drop_tol::Real = 0
+    ) where {Bi, T}
+    return _factor_kernel(A, sym, tol, nothing, real(T)(drop_tol))
 end
 
 """
-    csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:natural) -> CSRQRFactorization
+    csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:default, drop_tol=0) -> CSRQRFactorization
 
 One-shot convenience: equivalent to `csr_factor(A, csr_analyze(A; ordering); tol)`.
+
+When `ordering=:default` (the default), the column ordering is `:amd` if the
+AMD.jl extension is loaded (`using AMD`) and `:natural` otherwise. On the
+typical dense-fill matrices that arise from nonlinear solver linsolves,
+`:amd` roughly halves the factor time. Pass `ordering=:natural` to opt out
+for matrices whose columns are already well-ordered.
 """
-function csr_qr(A::SparseMatrixCSR{Bi, T};
-                tol::Union{Nothing, Real}=nothing,
-                ordering::Symbol=:natural) where {Bi, T}
-    sym = csr_analyze(A; ordering=ordering)
-    return csr_factor(A, sym; tol=tol)
+function csr_qr(
+        A::SparseMatrixCSR{Bi, T};
+        tol::Union{Nothing, Real} = nothing,
+        ordering::Symbol = :default,
+        drop_tol::Real = 0
+    ) where {Bi, T}
+    sym = csr_analyze(A; ordering = ordering)
+    return csr_factor(A, sym; tol = tol, drop_tol = drop_tol)
 end
 
 """
-    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing) -> CSRQRFactorization
+    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing, drop_tol=0) -> CSRQRFactorization
 
 Numeric refactorization, mutating `F` in place. If the sparsity pattern of
 `A` matches the one captured in `F.sym`, the symbolic is reused (skipping
@@ -530,18 +673,24 @@ workspace on the symbolic is reused — steady-state calls allocate nothing.
 Otherwise a fresh analyze is performed (and a new workspace lazily built)
 before refactoring.
 
+The `drop_tol` keyword has the same meaning as in [`csr_factor`](@ref).
+
 `F`'s `V_*`, `R_*`, `beta` buffers are overwritten with the new values
 (growing only if the previous bounds were undersized). The return value is
 `F` itself.
 """
-function csr_refactor!(F::CSRQRFactorization{T},
-                       A::SparseMatrixCSR{Bi};
-                       tol::Union{Nothing, Real}=nothing) where {T, Bi}
+function csr_refactor!(
+        F::CSRQRFactorization{T},
+        A::SparseMatrixCSR{Bi};
+        tol::Union{Nothing, Real} = nothing,
+        drop_tol::Real = 0
+    ) where {T, Bi}
+    dt = real(T)(drop_tol)
     if _pattern_matches(F.sym, A)
-        return _factor_kernel(A, F.sym, tol, F)
+        return _factor_kernel(A, F.sym, tol, F, dt)
     else
-        sym = csr_analyze(A; ordering=F.sym.ordering)
-        return _factor_kernel(A, sym, tol, F)
+        sym = csr_analyze(A; ordering = F.sym.ordering)
+        return _factor_kernel(A, sym, tol, F, dt)
     end
 end
 
@@ -552,8 +701,10 @@ end
 # Get (or lazily create) a numeric workspace of the right type attached to
 # the symbolic. Reuses on subsequent calls; falls back to a fresh allocation
 # if the cached workspace has a mismatched element type.
-@inline function _get_workspace(::Type{T}, sym::CSRQRSymbolic,
-                                 nnz_A::Int) where {T}
+@inline function _get_workspace(
+        ::Type{T}, sym::CSRQRSymbolic,
+        nnz_A::Int
+    ) where {T}
     RT = real(T)
     ws = sym.workspace
     if ws isa _CSRQRWorkspace{T, RT}
@@ -571,9 +722,12 @@ end
     return new_ws
 end
 
-function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
-                         tol::Union{Nothing, Real},
-                         F::Union{Nothing, CSRQRFactorization}) where {Bi, T}
+function _factor_kernel(
+        A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
+        tol::Union{Nothing, Real},
+        F::Union{Nothing, CSRQRFactorization},
+        drop_tol::Real = zero(real(T))
+    ) where {Bi, T}
     m, n = size(A)
     (m == sym.m && n == sym.n) ||
         throw(DimensionMismatch("A is $m x $n but symbolic is $(sym.m) x $(sym.n)"))
@@ -598,15 +752,17 @@ function _factor_kernel(A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
     # Apply row+column permutation S = (P A Q) into workspace buffers.
     _permute_pq!(ws, sym_use.pinv, sym_use.q, m, n)
 
-    return _csc_qr_numeric!(ws, sym_use, tol_use, tol2, F)
+    return _csc_qr_numeric!(ws, sym_use, tol_use, tol2, F, RT(drop_tol))
 end
 
 # In-place CSR -> CSC of A, plus per-column squared norms and ||A||_F^2.
 # Writes into ws.colptr_A, ws.rowval_A, ws.nzval_A, ws.col_nrm2. Returns
 # the Frobenius-norm-squared. ws.work_perm doubles as a temporary copy of
 # colptr used during scatter.
-function _csr_to_csc_with_norms!(ws::_CSRQRWorkspace{T, RT},
-                                 A::SparseMatrixCSR{Bi, T}) where {Bi, T, RT}
+function _csr_to_csc_with_norms!(
+        ws::_CSRQRWorkspace{T, RT},
+        A::SparseMatrixCSR{Bi, T}
+    ) where {Bi, T, RT}
     m, n = size(A)
     off = getoffset(A)
     rowptr = A.rowptr
@@ -661,8 +817,10 @@ end
 # In-place P A Q: writes the row- and column-permuted CSC into ws.colptr_S /
 # ws.rowval_S / ws.nzval_S. Uses ws.colptr_A / ws.rowval_A / ws.nzval_A as
 # input (filled by `_csr_to_csc_with_norms!`).
-function _permute_pq!(ws::_CSRQRWorkspace{T, RT}, pinv::Vector{Int},
-                      q::Vector{Int}, m::Int, n::Int) where {T, RT}
+function _permute_pq!(
+        ws::_CSRQRWorkspace{T, RT}, pinv::Vector{Int},
+        q::Vector{Int}, m::Int, n::Int
+    ) where {T, RT}
     colptr_A = ws.colptr_A; rowval_A = ws.rowval_A; nzval_A = ws.nzval_A
     colptr_S = ws.colptr_S; rowval_S = ws.rowval_S; nzval_S = ws.nzval_S
     colptr_S[1] = 1
@@ -687,9 +845,11 @@ end
 # the value-independent symbolic pieces (parent, leftmost, m2, pinv, vnz, rnz)
 # for the new ordering. Returns either the original `sym` (no zero columns)
 # or a freshly-built one.
-function _maybe_repivot_zero_cols_from_norms(col_norms::Vector{RT},
-                                              sym::CSRQRSymbolic,
-                                              fro_A::Real) where {RT}
+function _maybe_repivot_zero_cols_from_norms(
+        col_norms::Vector{RT},
+        sym::CSRQRSymbolic,
+        fro_A::Real
+    ) where {RT}
     n = sym.n
     eps_zero = RT(fro_A) * RT(eps(RT)) * RT(max(sym.m, n))
     thr2 = eps_zero * eps_zero
@@ -750,16 +910,22 @@ function _maybe_repivot_zero_cols_from_norms(col_norms::Vector{RT},
 
     # Rebuild symbolic with the new q'.
     q2, pinv2, parent2, leftmost2, m2_2, vnz2, rnz2, rcount2 =
-        _rebuild_symbolic_for_q(sym.pattern_rowptr, sym.pattern_colval,
-                                 sym.m, sym.n, q_new)
-    return CSRQRSymbolic(sym.m, sym.n, m2_2, q2, pinv2, parent2, leftmost2,
-                         vnz2, rnz2, rcount2, sym.ordering, sym.pattern_rowptr,
-                         sym.pattern_colval, sym.workspace)
+        _rebuild_symbolic_for_q(
+        sym.pattern_rowptr, sym.pattern_colval,
+        sym.m, sym.n, q_new
+    )
+    return CSRQRSymbolic(
+        sym.m, sym.n, m2_2, q2, pinv2, parent2, leftmost2,
+        vnz2, rnz2, rcount2, sym.ordering, sym.pattern_rowptr,
+        sym.pattern_colval, sym.workspace
+    )
 end
 
 # Rebuild symbolic data for a given q (a column permutation).
-function _rebuild_symbolic_for_q(rowptr::Vector{Int}, colval::Vector{Int},
-                                  m::Int, n::Int, q::Vector{Int})
+function _rebuild_symbolic_for_q(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        m::Int, n::Int, q::Vector{Int}
+    )
     # Reuse _build_symbolic but force the q we've chosen.
     colptr_q, rowval_q = _csr_pattern_to_csc_permuted(rowptr, colval, q, m, n)
     parent = _coletree_ata(colptr_q, rowval_q, m, n)
@@ -855,9 +1021,19 @@ end
 # Numeric loop. Mutates the workspace and (if F is non-nothing) the output
 # factorization's V/R/beta arrays in place. Returns a CSRQRFactorization
 # (the mutated F if provided, else a freshly-allocated one).
-function _csc_qr_numeric!(ws::_CSRQRWorkspace{T, RT}, sym::CSRQRSymbolic,
-                          tol_use::RT, tol2::RT,
-                          F::Union{Nothing, CSRQRFactorization}) where {T, RT}
+#
+# `drop_tol > 0` enables approximate-QR fill control: entries j >= 2 of a
+# Householder vector with `|x[vrows[q]]|^2 <= drop_tol^2 * vnorm2` are
+# dropped and `β_k` is recomputed from the surviving `|v|^2`. The diagonal
+# v1 is never dropped.
+function _csc_qr_numeric!(
+        ws::_CSRQRWorkspace{T, RT}, sym::CSRQRSymbolic,
+        tol_use::RT, tol2::RT,
+        F::Union{Nothing, CSRQRFactorization},
+        drop_tol::RT = zero(RT)
+    ) where {T, RT}
+    drop_active = drop_tol > zero(RT)
+    drop_tol2 = drop_tol * drop_tol
     m, n, m2 = sym.m, sym.n, sym.m2
     parent = sym.parent
     leftmost = sym.leftmost
@@ -1087,18 +1263,39 @@ function _csc_qr_numeric!(ws::_CSRQRWorkspace{T, RT}, sym::CSRQRSymbolic,
         # Skipping exact zeros keeps V columns numerically sparse: rows marked
         # by the apply-step row-tracking but cancelled to 0 by Householder
         # arithmetic don't pollute future apply walks.
+        #
+        # If `drop_tol > 0` is in effect we additionally drop entries
+        # j >= 2 whose magnitude satisfies |x[vrows[q]]|^2 <= drop_tol^2 *
+        # vnorm2, and then recompute β_k from the surviving |v|^2 so that
+        # H̃ = I - β̃ ṽ ṽ^T remains a proper Householder of the truncated ṽ.
+        # The diagonal v1 is never dropped.
         if vnz_total + vlen > length(Vi)
             _grow_pair!(Vi, Vx, vnz_total + vlen)
         end
         vnz_total += 1
         Vi[vnz_total] = k
         Vx[vnz_total] = v1
-        for q in 2:vlen
-            xv = x[vrows[q]]
-            if xv != zero(T)
-                vnz_total += 1
-                Vi[vnz_total] = vrows[q]
-                Vx[vnz_total] = xv
+        if drop_active
+            thr_drop2 = drop_tol2 * vnorm2
+            new_vnorm2 = abs2(v1)
+            for q in 2:vlen
+                xv = x[vrows[q]]
+                if xv != zero(T) && abs2(xv) > thr_drop2
+                    vnz_total += 1
+                    Vi[vnz_total] = vrows[q]
+                    Vx[vnz_total] = xv
+                    new_vnorm2 += abs2(xv)
+                end
+            end
+            beta_k = RT(2) / new_vnorm2
+        else
+            for q in 2:vlen
+                xv = x[vrows[q]]
+                if xv != zero(T)
+                    vnz_total += 1
+                    Vi[vnz_total] = vrows[q]
+                    Vx[vnz_total] = xv
+                end
             end
         end
         Vp[k + 1] = vnz_total + 1
@@ -1117,10 +1314,12 @@ function _csc_qr_numeric!(ws::_CSRQRWorkspace{T, RT}, sym::CSRQRSymbolic,
     resize!(Ri, rnz_total); resize!(Rx, rnz_total)
 
     if F === nothing
-        return CSRQRFactorization{T, RT}(sym.m, sym.n,
+        return CSRQRFactorization{T, RT}(
+            sym.m, sym.n,
             Vp, Vi, Vx,
             Rp, Ri, Rx,
-            beta, rnk, tol_use, sym)
+            beta, rnk, tol_use, sym
+        )
     else
         # Mutate F in place, refresh fields.
         F.m = sym.m; F.n = sym.n
@@ -1193,8 +1392,10 @@ end
 
 # Solve R z = c (R is upper triangular in CSC). Rank-revealing: rows
 # (k+1..n) of z are zeroed if R[k,k] is below threshold.
-function _usolve!(z::AbstractVector{T}, F::CSRQRFactorization{T},
-                   c::AbstractVector{T}) where {T}
+function _usolve!(
+        z::AbstractVector{T}, F::CSRQRFactorization{T},
+        c::AbstractVector{T}
+    ) where {T}
     n = F.n
     Rp = F.R_colptr; Ri = F.R_rowval; Rx = F.R_nzval
     tol_use = F.tol
@@ -1247,8 +1448,10 @@ function _usolve!(z::AbstractVector{T}, F::CSRQRFactorization{T},
     return z
 end
 
-function LinearAlgebra.ldiv!(x::AbstractVector{T}, F::CSRQRFactorization{T},
-                              b::AbstractVector{T}) where {T}
+function LinearAlgebra.ldiv!(
+        x::AbstractVector{T}, F::CSRQRFactorization{T},
+        b::AbstractVector{T}
+    ) where {T}
     length(b) == F.m || throw(DimensionMismatch("b length $(length(b)) != m=$(F.m)"))
     length(x) == F.n || throw(DimensionMismatch("x length $(length(x)) != n=$(F.n)"))
     m, n, m2 = F.m, F.n, F.sym.m2

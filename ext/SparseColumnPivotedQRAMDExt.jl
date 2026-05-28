@@ -4,6 +4,13 @@ using SparseColumnPivotedQR
 using SparseArrays
 using AMD
 
+# Flag the host module so `:default` ordering resolves to `:amd` and so the
+# `:amd` opt-in doesn't error. Set on extension load, never cleared.
+function __init__()
+    SparseColumnPivotedQR._AMD_EXT_LOADED[] = true
+    return nothing
+end
+
 # Override the AMD column ordering hook in SparseColumnPivotedQR.
 # Builds a CSC SparseMatrixCSC from the (rowptr, colval) CSR pattern and asks
 # AMD.colamd for an unsymmetric column ordering. Falls back to natural if AMD
