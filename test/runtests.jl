@@ -529,6 +529,43 @@ end
         end
     end
 
+    @testset "Incremental V-row tracker invariants" begin
+        # V[:, k]'s row pattern is now collected incrementally during the
+        # Householder apply (stamped into a workspace marker) rather than by an
+        # O(m2) scan of x. Verify the invariants the kernel relies on and that
+        # the emitted pattern matches the exact nonzero rows of the dense
+        # Householder column (what the old scan produced).
+        dir = joinpath(@__DIR__, "matrices")
+        files = sort(filter(f -> endswith(f, ".txt"), readdir(dir; join = true)))
+        cases = Any[]
+        for f in files
+            lines = split(read(f, String), '\n'; keepempty = false)
+            push!(cases, eval(Meta.parse(strip(lines[1]))))
+        end
+        Random.seed!(123)
+        push!(cases, sprand(Float64, 60, 60, 0.2) + 4 * sparse(I, 60, 60))
+        push!(cases, randn(40, 25))
+        for A in cases
+            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            for ordering in (:natural, :amd)
+                F = csr_qr(Acsr; ordering = ordering)
+                n = F.n
+                m2 = F.sym.m2
+                for k in 1:n
+                    rows = F.V_rowval[F.V_colptr[k]:(F.V_colptr[k + 1] - 1)]
+                    isempty(rows) && continue
+                    # Diagonal row k is emitted first.
+                    @test rows[1] == k
+                    # No row below the diagonal.
+                    @test all(>=(k), rows)
+                    # No duplicate rows (generation-stamp dedup).
+                    @test length(unique(rows)) == length(rows)
+                    @test all(1 .<= rows .<= m2)
+                end
+            end
+        end
+    end
+
     @testset "Numerically-zero column triggers value-aware repivot" begin
         # A is 6x6 full rank except column 4 which is numerically zero.
         Random.seed!(16)

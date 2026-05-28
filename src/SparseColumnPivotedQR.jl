@@ -77,11 +77,19 @@ mutable struct _CSRQRWorkspace{T, RT}
     s::Vector{Int}
     w::Vector{Int}
     vrows::Vector{Int}
+    # Generation-stamped marker over the m2 row space. The numeric kernel uses
+    # it to collect V[:, k]'s nonzero-row pattern incrementally during the
+    # Householder apply (each row touched by the scatter / AXPY is stamped
+    # once) instead of scanning x[k+1 .. m2] afterwards. Same no-clear trick as
+    # `w`: the stamp is `vgen * (m2 + 1) + k`.
+    vmark::Vector{Int}
     # Generation counter used as a "stamp base" for the `w` marker array so
     # that the numeric kernel doesn't have to zero `w` between calls. The
     # stamp value used in the kernel is `gen * (n + 1) + k`; an `n`-sized
     # `w` is then compared against this monotonic generation-encoded stamp.
     wgen::Int
+    # Same as `wgen` but for the `vmark` marker; stamp is `vgen * (m2 + 1) + k`.
+    vgen::Int
 end
 
 function _alloc_workspace(
@@ -102,6 +110,8 @@ function _alloc_workspace(
         Vector{Int}(undef, n),
         zeros(Int, n),
         Vector{Int}(undef, m2),
+        zeros(Int, m2),
+        0,
         0,
     )
 end
@@ -1132,12 +1142,22 @@ function _csc_qr_numeric!(
     s = ws.s
     w = ws.w
     vrows = ws.vrows
+    vmark = ws.vmark
     # Make sure dense buffers can fit if sym.m2 changed (shouldn't, but defend).
     if length(x) < m2
         resize!(x, m2); fill!(x, zero(T))
     end
     if length(vrows) < m2
         resize!(vrows, m2)
+    end
+    # `vmark` must be zero so the generation-stamp comparison works. Grow and
+    # zero the tail if m2 grew since allocation (m2 is sym-fixed normally).
+    if length(vmark) < m2
+        Lold = length(vmark)
+        resize!(vmark, m2)
+        @inbounds for i in (Lold + 1):m2
+            vmark[i] = 0
+        end
     end
     # If `w` capacity grew (because we ran on a smaller sym previously then
     # a larger one), we'd need to zero the tail. In practice n is fixed.
@@ -1179,14 +1199,33 @@ function _csc_qr_numeric!(
     ws.wgen += 1
     wbase = ws.wgen * (n + 1)
 
+    # Same generation scheme for the V-row marker over the m2 row space. A row
+    # stamped with `vbase + k` is recognised as "already collected for column
+    # k" and not appended to vrows twice.
+    ws.vgen += 1
+    vbase = ws.vgen * (m2 + 1)
+
     @inbounds for k in 1:n
         kstamp = wbase + k
+        vstamp = vbase + k
+        # V[:, k]'s row pattern is collected incrementally below: vrows[1] is
+        # the diagonal row k; vrows[2..vlen] are the rows > k touched by the
+        # original scatter of S[:, k] or by a Householder apply. Row k is
+        # pre-stamped so the apply never re-appends it.
+        vrows[1] = k
+        vlen = 1
+        vmark[k] = vstamp
         # --- 1) ereach pattern of R[:,k] + scatter S[:,k] into x ---------
         top = n + 1
         c1 = colptr[k]; c2 = colptr[k + 1] - 1
         for p in c1:c2
             i = rowval[p]
             x[i] = nzval[p]
+            if i > k && vmark[i] != vstamp
+                vmark[i] = vstamp
+                vlen += 1
+                vrows[vlen] = i
+            end
             lm = leftmost[i]
             if lm > 0 && lm <= k
                 len = 0
@@ -1214,10 +1253,10 @@ function _csc_qr_numeric!(
         # order: apply H_1, H_2, ..., H_{k-1} (the original order of the
         # outer QR loop).
         #
-        # We deliberately do NOT track V[:,k]'s row pattern here. Instead we
-        # scan x[k..m2] for nonzeros at the end of the apply phase. This
-        # keeps the apply inner loop branch-free (the tau dot-product and
-        # AXPY both vectorize well).
+        # The AXPY pass also collects V[:, k]'s nonzero-row pattern: every row
+        # > k that an apply writes is stamped into `vmark` (deduplicated) and
+        # appended to `vrows`. This replaces the O(m2 - k) post-apply scan of
+        # x[k+1 .. m2] with work proportional to the rows actually touched.
         for spos in top:n
             p_idx = s[spos]
             if p_idx == k
@@ -1231,8 +1270,23 @@ function _csc_qr_numeric!(
             end
             if bk != 0 && tau != 0
                 tau_b = T(bk) * tau
-                @simd for vp in vc1:vc2
-                    x[Vi[vp]] -= tau_b * Vx[vp]
+                # Fused AXPY + V-row collection in one scalar pass over the
+                # Householder's nonzeros. This forgoes @simd on the AXPY but
+                # removes both the post-apply scan and a second marking pass,
+                # which measured faster overall here. Over-inclusion of a row
+                # that cancels back to exactly 0 is harmless: the emit step
+                # filters exact zeros and the Householder norm/clear loops are
+                # unaffected by a zero entry, so V/R keep the same structure as
+                # the old scan (values differ only by FP rounding noise near 0,
+                # from dropping the vectorized/FMA AXPY).
+                for vp in vc1:vc2
+                    i = Vi[vp]
+                    x[i] -= tau_b * Vx[vp]
+                    if i > k && vmark[i] != vstamp
+                        vmark[i] = vstamp
+                        vlen += 1
+                        vrows[vlen] = i
+                    end
                 end
             end
             # Emit R[p_idx, k] = x[p_idx]; clear x[p_idx].
@@ -1245,18 +1299,13 @@ function _csc_qr_numeric!(
             x[p_idx] = zero(T)
         end
 
-        # --- 2b) Build V[:,k]'s row list by scanning x[k..m2] for nonzeros.
-        # The row indices are written into vrows[1..vlen], with vrows[1] = k
-        # (the diagonal row) and the remaining entries being rows > k with
-        # x[i] != 0.
-        vrows[1] = k
-        vlen = 1
-        for i in (k + 1):m2
-            if x[i] != zero(T)
-                vlen += 1
-                vrows[vlen] = i
-            end
-        end
+        # --- 2b) V[:,k]'s row list is already collected ------------------
+        # vrows[1] == k (diagonal); vrows[2..vlen] are the rows > k collected
+        # incrementally during the scatter/apply above, in arbitrary touch
+        # order. No sort is needed: every consumer of V[:, k] (the in-kernel
+        # norm/clear loops, the V emit, `_apply_Q!`/`_apply_QH!`) does only
+        # order-independent reductions / AXPYs over the column, and the
+        # diagonal row k is always emitted first (vrows[1]).
 
         # --- 3) Build Householder for x[vrows[1..vlen]] -----------------
         # Compute alpha, beta_k. v[1] = x[vrows[1]] - alpha; v[j>=2] unchanged.
