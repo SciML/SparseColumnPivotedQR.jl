@@ -12,12 +12,12 @@ let
     parent_pkg = abspath(joinpath(@__DIR__, ".."))
     cxsparse_pkg = abspath(joinpath(@__DIR__, "..", "..", "CXSparse.jl"))
     try
-        Pkg.develop(path=parent_pkg)
+        Pkg.develop(path = parent_pkg)
     catch
     end
     if isdir(cxsparse_pkg)
         try
-            Pkg.develop(path=cxsparse_pkg)
+            Pkg.develop(path = cxsparse_pkg)
         catch
         end
     end
@@ -35,31 +35,38 @@ catch
     false
 end
 
+# Prefer the matrices bundled with the test suite; fall back to the original
+# upload location if present (developer convenience).
+const BUNDLED = abspath(joinpath(@__DIR__, "..", "test", "matrices"))
 const UPLOADS = "/home/crackauc/.claude/uploads/d279ff12-71e6-4faf-b1ac-6715899a256b"
-files = isdir(UPLOADS) ? sort(readdir(UPLOADS; join=true)) : String[]
+const MATDIR = isdir(BUNDLED) ? BUNDLED : UPLOADS
+files = isdir(MATDIR) ?
+    sort(filter(f -> endswith(f, ".txt"), readdir(MATDIR; join = true))) : String[]
 
 function load_case(f)
     text = read(f, String)
-    lines = split(text, "\n"; keepempty=false)
+    lines = split(text, "\n"; keepempty = false)
     A = eval(Meta.parse(strip(lines[1])))
     b = eval(Meta.parse(strip(lines[2])))
     return A, b
 end
 
 function fmt_row(file, solver, t_us, res, nn)
-    @printf("%-30s %-22s %10s   %12s   %6d\n",
-            file, solver,
-            isnan(t_us) ? "-" : @sprintf("%9.1f", t_us),
-            isnan(res) ? "NaN" : @sprintf("%.3e", res),
-            nn)
+    return @printf(
+        "%-30s %-22s %10s   %12s   %6d\n",
+        file, solver,
+        isnan(t_us) ? "-" : @sprintf("%9.1f", t_us),
+        isnan(res) ? "NaN" : @sprintf("%.3e", res),
+        nn
+    )
 end
 
 println()
-println("=" ^ 95)
+println("="^95)
 println("Benchmarks on user matrices (199x199, nnz≈979); minimum time of @benchmark seconds=1")
-println("=" ^ 95)
+println("="^95)
 @printf("%-30s %-22s %10s   %12s   %6s\n", "file", "solver", "time (μs)", "||Ax-b||", "nnan(x)")
-println("-" ^ 95)
+println("-"^95)
 
 for f in files
     A, b = load_case(f)
@@ -68,53 +75,53 @@ for f in files
     short = first(basename(f), 28)
 
     # 1) SparseColumnPivotedQR — natural ordering, one-shot csr_qr
-    F = csr_qr(Acsr; ordering=:natural); x = F \ b
+    F = csr_qr(Acsr; ordering = :natural); x = F \ b
     t = @benchmark begin
-        F2 = csr_qr($Acsr; ordering=:natural); $x .= F2 \ $b
-    end seconds=1
-    res = all(isfinite, x) ? norm(A*x - b) : NaN
+        F2 = csr_qr($Acsr; ordering = :natural); $x .= F2 \ $b
+    end seconds = 1
+    res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
-    fmt_row(short, "CSR-QR natural", minimum(t.times)/1000, res, nn)
+    fmt_row(short, "CSR-QR natural", minimum(t.times) / 1000, res, nn)
 
     # 2) SparseColumnPivotedQR — AMD ordering, one-shot csr_qr
-    F = csr_qr(Acsr; ordering=:amd); x = F \ b
+    F = csr_qr(Acsr; ordering = :amd); x = F \ b
     t = @benchmark begin
-        F2 = csr_qr($Acsr; ordering=:amd); $x .= F2 \ $b
-    end seconds=1
-    res = all(isfinite, x) ? norm(A*x - b) : NaN
+        F2 = csr_qr($Acsr; ordering = :amd); $x .= F2 \ $b
+    end seconds = 1
+    res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
-    fmt_row(short, "CSR-QR amd", minimum(t.times)/1000, res, nn)
+    fmt_row(short, "CSR-QR amd", minimum(t.times) / 1000, res, nn)
 
     # 3) SparseColumnPivotedQR — refactor! reusing natural symbolic
-    sym = csr_analyze(Acsr; ordering=:natural)
+    sym = csr_analyze(Acsr; ordering = :natural)
     F0 = csr_factor(Acsr, sym); x = F0 \ b
     t = @benchmark begin
         F2 = csr_refactor!($F0, $Acsr); $x .= F2 \ $b
-    end seconds=1
-    res = all(isfinite, x) ? norm(A*x - b) : NaN
+    end seconds = 1
+    res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
-    fmt_row(short, "CSR-QR refactor! (nat)", minimum(t.times)/1000, res, nn)
+    fmt_row(short, "CSR-QR refactor! (nat)", minimum(t.times) / 1000, res, nn)
 
     # 3b) SparseColumnPivotedQR — refactor! reusing AMD symbolic. This is
     # the apples-to-apples comparison to CXSparse cs_qr: AMD ordering up front
     # and only the numeric phase running per solve call.
-    sym_amd = csr_analyze(Acsr; ordering=:amd)
+    sym_amd = csr_analyze(Acsr; ordering = :amd)
     F0_amd = csr_factor(Acsr, sym_amd); x = F0_amd \ b
     t = @benchmark begin
         F2 = csr_refactor!($F0_amd, $Acsr); $x .= F2 \ $b
-    end seconds=1
-    res = all(isfinite, x) ? norm(A*x - b) : NaN
+    end seconds = 1
+    res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
-    fmt_row(short, "CSR-QR refactor! (amd)", minimum(t.times)/1000, res, nn)
+    fmt_row(short, "CSR-QR refactor! (amd)", minimum(t.times) / 1000, res, nn)
 
     # 4) SuiteSparseQR (SPQR) via qr(::SparseMatrixCSC)
     Fs = qr(A); xs = Fs \ b
     t = @benchmark begin
         F2 = qr($A); $xs .= F2 \ $b
-    end seconds=1
-    res = all(isfinite, xs) ? norm(A*xs - b) : NaN
+    end seconds = 1
+    res = all(isfinite, xs) ? norm(A * xs - b) : NaN
     nn = count(!isfinite, xs)
-    fmt_row(short, "SPQR", minimum(t.times)/1000, res, nn)
+    fmt_row(short, "SPQR", minimum(t.times) / 1000, res, nn)
 
     # 5) CXSparse cs_qr (if available)
     if cxsparse_ok
@@ -122,10 +129,10 @@ for f in files
             Fcx = CXSparse.cs_qr(A); xcx = Fcx \ b
             t = @benchmark begin
                 F2 = CXSparse.cs_qr($A); $xcx .= F2 \ $b
-            end seconds=1
-            res = all(isfinite, xcx) ? norm(A*xcx - b) : NaN
+            end seconds = 1
+            res = all(isfinite, xcx) ? norm(A * xcx - b) : NaN
             nn = count(!isfinite, xcx)
-            fmt_row(short, "CXSparse cs_qr", minimum(t.times)/1000, res, nn)
+            fmt_row(short, "CXSparse cs_qr", minimum(t.times) / 1000, res, nn)
         catch e
             println("    CXSparse cs_qr failed: ", e)
         end
@@ -135,10 +142,10 @@ for f in files
     Fd = qr(Adense, ColumnNorm()); xd = Fd \ b
     t = @benchmark begin
         F2 = qr($Adense, ColumnNorm()); $xd .= F2 \ $b
-    end seconds=1
-    res = all(isfinite, xd) ? norm(A*xd - b) : NaN
+    end seconds = 1
+    res = all(isfinite, xd) ? norm(A * xd - b) : NaN
     nn = count(!isfinite, xd)
-    fmt_row(short, "LAPACK xgeqp3", minimum(t.times)/1000, res, nn)
+    fmt_row(short, "LAPACK xgeqp3", minimum(t.times) / 1000, res, nn)
 
     println()
 end
