@@ -184,9 +184,9 @@ end
         sym_col = csr_analyze(Acsr; ordering = :colamd)
 
         # AMD should produce a non-identity permutation on a random matrix
-        @test sym_amd.colperm != 1:n
+        @test sym_amd.q != 1:n
         # colamd ordering is currently aliased to amd
-        @test sym_col.colperm == sym_amd.colperm
+        @test sym_col.q == sym_amd.q
 
         F_nat = csr_factor(Acsr, sym_nat); x_nat = F_nat \ b
         F_amd = csr_factor(Acsr, sym_amd); x_amd = F_amd \ b
@@ -197,8 +197,8 @@ end
         @test norm(A * x_amd - b) / norm(b) < 1.0e-10
 
         # AMD should not blow up fill: total nnz(R) <= natural's by a reasonable factor
-        nnz_nat = sum(length, F_nat.R_cols)
-        nnz_amd = sum(length, F_amd.R_cols)
+        nnz_nat = length(F_nat.R_nzval)
+        nnz_amd = length(F_amd.R_nzval)
         # No strict inequality (AMD can lose on some matrices), but shouldn't be wildly worse.
         @test nnz_amd <= 4 * nnz_nat
     end
@@ -253,6 +253,73 @@ end
         @test norm(A * x_nat - b) / norm(b) < 1.0e-10
         @test norm(A * x_amd - b) / norm(b) < 1.0e-10
         @test rank(F_nat) == rank(F_amd) == n
+    end
+
+    @testset "CSC internal storage: V and R reconstruct A" begin
+        Random.seed!(15)
+        n = 25
+        A = randn(n, n) + 4 * I
+        Acsr = build_csr(A)
+        F = csr_qr(Acsr; ordering = :natural)
+        # Reconstruct R as a dense matrix.
+        R = zeros(n, n)
+        for k in 1:n
+            for p in F.R_colptr[k]:(F.R_colptr[k + 1] - 1)
+                R[F.R_rowval[p], k] = F.R_nzval[p]
+            end
+        end
+        # Upper triangular?
+        for k in 1:n
+            for p in F.R_colptr[k]:(F.R_colptr[k + 1] - 1)
+                @test F.R_rowval[p] <= k
+            end
+        end
+        # Reconstruct V as a dense matrix in the m2-padded row space.
+        m2 = F.sym.m2
+        V = zeros(m2, n)
+        for k in 1:n
+            for p in F.V_colptr[k]:(F.V_colptr[k + 1] - 1)
+                V[F.V_rowval[p], k] = F.V_nzval[p]
+            end
+        end
+        # Q = (I - β_k v_k v_k^T)_{k=n..1}, m2 x m2 orthogonal.
+        Q = Matrix{Float64}(I, m2, m2)
+        for k in n:-1:1
+            v = V[:, k]
+            Q = (Matrix{Float64}(I, m2, m2) - F.beta[k] * v * transpose(v)) * Q
+        end
+        @test norm(transpose(Q) * Q - I) < 1.0e-10
+        # Reconstruct P A Q (column-permuted): row i of A maps to slot pinv[i],
+        # col j of A appears at q-position invq[j].
+        P = zeros(m2, n)
+        for i in 1:n
+            P[F.sym.pinv[i], i] = 1
+        end
+        PAq = P * A[:, F.sym.q]
+        # Q * [R; 0] should equal P A Q.
+        R_ext = vcat(R, zeros(m2 - n, n))
+        @test norm(Q * R_ext - PAq) < 1.0e-10
+    end
+
+    @testset "Numerically-zero column triggers value-aware repivot" begin
+        # A is 6x6 full rank except column 4 which is numerically zero.
+        Random.seed!(16)
+        n = 6
+        A = randn(n, n) + 3 * I
+        A[:, 4] .= 0   # numerically zero column
+        Acsr = build_csr(A)
+        b = randn(n)
+        F = csr_qr(Acsr)
+        # rank should be n - 1
+        @test rank(F) == n - 1
+        # The trailing q position should hold the original column 4.
+        @test F.sym.q[end] == 4
+        # solve should still be finite and match SPQR.
+        x = F \ b
+        @test all(isfinite, x)
+        Fs = qr(sparse(A))
+        xs = Fs \ b
+        @test norm(A * x - b) ≈ norm(A * xs - b) atol = 1.0e-8
     end
 
 end
