@@ -687,4 +687,140 @@ end
         end
     end
 
+    @testset "WY-blocked Householder kernel: block_size sweep matches unblocked" begin
+        # Schreiber–van Loan compact WY: for any block_size >= 1 the
+        # factorization must give the same (V, R) up to ulps as block_size = 1.
+        # Block size = 1 routes through the Davis-style unblocked kernel; > 1
+        # routes through _csc_qr_numeric_wy with a packed T per panel.
+        Random.seed!(101)
+        for (n, density) in [(20, 0.3), (50, 0.2), (80, 0.15)]
+            A = sprand(Float64, n, n, density) + 0.1 * sparse(I, n, n)
+            Acsr = build_csr(Matrix(A))
+            b = randn(n)
+            F_nat_ref = csr_qr(Acsr; ordering = :natural)
+            x_nat_ref = F_nat_ref \ b
+            F_amd_ref = csr_qr(Acsr; ordering = :amd)
+            x_amd_ref = F_amd_ref \ b
+
+            for bs in (1, 2, 4, 8, 16, 32)
+                # Natural ordering.
+                F_nat = csr_qr(Acsr; ordering = :natural, block_size = bs)
+                x_nat = F_nat \ b
+                @test rank(F_nat) == rank(F_nat_ref)
+                @test norm(A * x_nat - b) / max(norm(b), 1.0) < 1.0e-10
+                @test norm(x_nat - x_nat_ref) / max(norm(x_nat_ref), 1.0) < 1.0e-10
+                # AMD ordering.
+                F_amd = csr_qr(Acsr; ordering = :amd, block_size = bs)
+                x_amd = F_amd \ b
+                @test rank(F_amd) == rank(F_amd_ref)
+                @test norm(A * x_amd - b) / max(norm(b), 1.0) < 1.0e-10
+                @test norm(x_amd - x_amd_ref) / max(norm(x_amd_ref), 1.0) < 1.0e-10
+            end
+        end
+    end
+
+    @testset "WY-blocked kernel: rank-deficient case matches unblocked" begin
+        # Construct a rank-deficient overdetermined problem and check that
+        # every block size produces the same rank and same LS residual.
+        Random.seed!(102)
+        m, n = 30, 12
+        U = randn(m, n - 2)
+        V = randn(n, n - 2)
+        Adense = U * V'
+        Acsr = build_csr(Adense)
+        b = randn(m)
+        Fref = csr_qr(Acsr; ordering = :natural, block_size = 1, tol = 1.0e-10)
+        xref = Fref \ b
+        r_ref = norm(Adense * xref - b)
+        for bs in (2, 4, 8, 16)
+            F = csr_qr(Acsr; ordering = :natural, block_size = bs, tol = 1.0e-10)
+            x = F \ b
+            @test rank(F) == rank(Fref)
+            @test all(isfinite, x)
+            @test norm(Adense * x - b) ≈ r_ref atol = 1.0e-8
+        end
+    end
+
+    @testset "WY-blocked kernel: user 199x199 matrices match SPQR residuals" begin
+        # Regression: across all the bundled user matrices, the block_size
+        # sweep must match SPQR residuals to the same tolerance as block_size = 1.
+        dir = "/home/crackauc/.claude/uploads/d279ff12-71e6-4faf-b1ac-6715899a256b"
+        if isdir(dir)
+            files = sort(readdir(dir; join = true))
+            for f in files
+                text = read(f, String)
+                lines = split(text, '\n'; keepempty = false)
+                A = eval(Meta.parse(strip(lines[1])))
+                b = eval(Meta.parse(strip(lines[2])))
+                Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+                if !all(isfinite, b)
+                    continue
+                end
+                Fspqr = qr(A)
+                rmy_spqr = norm(A * (Fspqr \ b) - b)
+                scale = max(rmy_spqr, 1.0e-12 * norm(b))
+                for bs in (2, 4, 8, 16)
+                    F = csr_qr(Acsr; ordering = :amd, block_size = bs)
+                    x = F \ b
+                    @test all(isfinite, x)
+                    @test norm(A * x - b) <= 1.0e-8 + 2 * scale
+                end
+            end
+        else
+            @info "User matrix directory not available; skipping WY user-matrix regression."
+        end
+    end
+
+    @testset "WY-blocked kernel: refactor! propagates block_size" begin
+        Random.seed!(103)
+        n = 25
+        Asp = sprand(Float64, n, n, 0.2)
+        rows, cols, _ = findnz(Asp)
+        v1 = randn(length(rows))
+        v2 = randn(length(rows))
+        A1 = sparse(rows, cols, v1, n, n) + 4 * sparse(I, n, n)
+        A2 = sparse(rows, cols, v2, n, n) + 4 * sparse(I, n, n)
+        Acsr1 = build_csr(Matrix(A1))
+        Acsr2 = build_csr(Matrix(A2))
+        b = randn(n)
+        F = csr_qr(Acsr1; ordering = :amd, block_size = 4)
+        x1 = F \ b
+        @test norm(A1 * x1 - b) / norm(b) < 1.0e-10
+        # refactor! with new values + same block_size.
+        F2 = csr_refactor!(F, Acsr2; block_size = 4)
+        x2 = F2 \ b
+        @test norm(A2 * x2 - b) / norm(b) < 1.0e-10
+        # The refactor!'d block_size = 4 result should match a fresh
+        # block_size = 1 factor of A2 (up to floating-point order).
+        Fcheck = csr_qr(Acsr2; ordering = :amd, block_size = 1)
+        xcheck = Fcheck \ b
+        @test norm(x2 - xcheck) / max(norm(xcheck), 1.0) < 1.0e-9
+    end
+
+    @testset "WY-blocked kernel: ComplexF64 across block sizes" begin
+        Random.seed!(104)
+        n = 15
+        Adense = randn(ComplexF64, n, n) + 2 * I
+        Acsr = build_csr(Adense)
+        b = randn(ComplexF64, n)
+        F1 = csr_qr(Acsr; block_size = 1)
+        x1 = F1 \ b
+        for bs in (2, 4, 8)
+            F = csr_qr(Acsr; block_size = bs)
+            x = F \ b
+            @test rank(F) == n
+            @test norm(Adense * x - b) / norm(b) < 1.0e-10
+            @test norm(x - x1) / max(norm(x1), 1.0) < 1.0e-10
+        end
+    end
+
+    @testset "WY-blocked kernel: block_size <= 0 errors" begin
+        Random.seed!(105)
+        n = 5
+        A = randn(n, n) + 3 * I
+        Acsr = build_csr(A)
+        @test_throws ArgumentError csr_qr(Acsr; block_size = 0)
+        @test_throws ArgumentError csr_qr(Acsr; block_size = -1)
+    end
+
 end

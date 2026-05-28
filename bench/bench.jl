@@ -164,6 +164,22 @@ for f in files
     nn = count(!isfinite, x)
     fmt_row(short, "CSR-QR refactor! (amd+ad)", minimum(t.times) / 1000, res, nn)
 
+    # 3c) SparseColumnPivotedQR — refactor! with compact-WY blocking on the
+    # AMD symbolic. block_size = 1 is the default (matches row 3b); we sweep
+    # a few values to show where the block path stands. On the user matrices
+    # the block path is not a win (the T-build + sort overhead exceeds the
+    # per-Householder loop-overhead savings at this size/density); on larger
+    # / denser inputs the two paths trend toward parity.
+    for bs in (2, 4, 8, 16)
+        F0_wy = csr_factor(Acsr, sym_amd; block_size = bs); x = F0_wy \ b
+        t = @benchmark begin
+            F2 = csr_refactor!($F0_wy, $Acsr; block_size = $bs); $x .= F2 \ $b
+        end seconds = 1
+        res = all(isfinite, x) ? norm(A * x - b) : NaN
+        nn = count(!isfinite, x)
+        fmt_row(short, "CSR-QR refactor! (amd, WY bs=$bs)", minimum(t.times) / 1000, res, nn)
+    end
+
     # 4) SuiteSparseQR (SPQR) via qr(::SparseMatrixCSC)
     Fs = qr(A); xs = Fs \ b
     t = @benchmark begin

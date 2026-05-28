@@ -12,6 +12,24 @@ export csr_qr, csr_analyze, csr_factor, csr_refactor!,
     has_amd_extension,
     CSRQRSymbolic, CSRQRFactorization
 
+# Compact WY (Schreiber–van Loan 1989) blocking is available behind the
+# `block_size` kwarg on `csr_factor` / `csr_qr` / `csr_refactor!`. The
+# default `block_size = 1` selects the Davis-style one-Householder-at-a-time
+# numeric kernel (with the pooled workspace, drop_tol, and adaptive-dense
+# fallback). For `block_size > 1` the panel-blocked WY kernel is used: panels
+# of `block_size` consecutive Householders are aggregated into a packed T and
+# applied as a block. The WY path is provided for larger / denser problems
+# where the BLAS-3-like block apply pays off; it does not currently combine
+# with the `adaptive_dense` or `drop_tol` options (those are honoured only on
+# the default `block_size = 1` path).
+
+# Minimum number of ereach hits in a panel to switch from one-at-a-time
+# applies to the WY block path inside `_csc_qr_numeric_wy!`. Below this,
+# the per-Householder apply is cheaper than the V_p^* x / T_p^* t / V_p t
+# block triple for the sparse panels that arise at small `block_size` like
+# `block_size = 2` or `4`.
+const WY_BLOCK_MIN_HITS = 2
+
 # CSR offset: rowptr stores 1-based if Bi == 1, 0-based if Bi == 0.
 @inline function getoffset(::SparseMatrixCSR{Bi}) where {Bi}
     return Bi == 1 ? 0 : 1
@@ -634,11 +652,21 @@ end
 
 """
     csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing, drop_tol=0,
-               adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
+               adaptive_dense=false, dense_threshold=0.4, block_size=1) -> CSRQRFactorization
 
 Numeric factorization given a `CSRQRSymbolic`. Implements the Davis
 `cs_qr` algorithm (scatter–apply–emit on a dense workspace) with the V/R
 buffers pre-sized from the symbolic phase.
+
+`block_size` controls compact-WY Householder blocking (Schreiber–van Loan
+1989). With `block_size = 1` (default) the kernel applies one Householder
+at a time, matching Davis cs_qr, and supports the `drop_tol` and
+`adaptive_dense` options. With `block_size > 1`, consecutive panels of
+`block_size` Householders are aggregated into a packed `T` and applied as a
+block; this path does not currently combine with `drop_tol` or
+`adaptive_dense`. `block_size = 1` is the fastest choice for the small
+sparse matrices this package targets; larger blocks help denser / larger
+problems.
 
 `tol === nothing` selects the default `eps(real(T)) * max(m, n) * ‖A‖_F`.
 Columns whose post-Householder diagonal magnitude falls below `tol` are
@@ -666,11 +694,12 @@ function csr_factor(
         tol::Union{Nothing, Real} = nothing,
         drop_tol::Real = 0,
         adaptive_dense::Bool = false,
-        dense_threshold::Real = 0.4
+        dense_threshold::Real = 0.4,
+        block_size::Integer = 1
     ) where {Bi, T}
     return _factor_kernel(
         A, sym, tol, nothing, real(T)(drop_tol),
-        adaptive_dense, real(T)(dense_threshold)
+        adaptive_dense, real(T)(dense_threshold), Int(block_size)
     )
 end
 
@@ -692,12 +721,14 @@ function csr_qr(
         ordering::Symbol = :default,
         drop_tol::Real = 0,
         adaptive_dense::Bool = false,
-        dense_threshold::Real = 0.4
+        dense_threshold::Real = 0.4,
+        block_size::Integer = 1
     ) where {Bi, T}
     sym = csr_analyze(A; ordering = ordering)
     return csr_factor(
         A, sym; tol = tol, drop_tol = drop_tol,
-        adaptive_dense = adaptive_dense, dense_threshold = dense_threshold
+        adaptive_dense = adaptive_dense, dense_threshold = dense_threshold,
+        block_size = block_size
     )
 end
 
@@ -726,15 +757,17 @@ function csr_refactor!(
         tol::Union{Nothing, Real} = nothing,
         drop_tol::Real = 0,
         adaptive_dense::Bool = false,
-        dense_threshold::Real = 0.4
+        dense_threshold::Real = 0.4,
+        block_size::Integer = 1
     ) where {T, Bi}
     dt = real(T)(drop_tol)
     dth = real(T)(dense_threshold)
+    bs = Int(block_size)
     if _pattern_matches(F.sym, A)
-        return _factor_kernel(A, F.sym, tol, F, dt, adaptive_dense, dth)
+        return _factor_kernel(A, F.sym, tol, F, dt, adaptive_dense, dth, bs)
     else
         sym = csr_analyze(A; ordering = F.sym.ordering)
-        return _factor_kernel(A, sym, tol, F, dt, adaptive_dense, dth)
+        return _factor_kernel(A, sym, tol, F, dt, adaptive_dense, dth, bs)
     end
 end
 
@@ -772,11 +805,14 @@ function _factor_kernel(
         F::Union{Nothing, CSRQRFactorization},
         drop_tol::Real = zero(real(T)),
         adaptive_dense::Bool = false,
-        dense_threshold::Real = real(T)(0.4)
+        dense_threshold::Real = real(T)(0.4),
+        block_size::Int = 1
     ) where {Bi, T}
     m, n = size(A)
     (m == sym.m && n == sym.n) ||
         throw(DimensionMismatch("A is $m x $n but symbolic is $(sym.m) x $(sym.n)"))
+    block_size >= 1 ||
+        throw(ArgumentError("block_size must be ≥ 1 (got $block_size)"))
 
     RT = real(T)
     nnz_A = length(A.colval)
@@ -797,6 +833,12 @@ function _factor_kernel(
 
     # Apply row+column permutation S = (P A Q) into workspace buffers.
     _permute_pq!(ws, sym_use.pinv, sym_use.q, m, n)
+
+    if block_size > 1
+        # Compact-WY blocked path. Does not combine with drop_tol /
+        # adaptive_dense (those are honoured only on the block_size = 1 path).
+        return _csc_qr_numeric_wy!(ws, sym_use, tol_use, tol2, F, block_size)
+    end
 
     return _csc_qr_numeric!(
         ws, sym_use, tol_use, tol2, F, RT(drop_tol),
@@ -1623,6 +1665,410 @@ function _finish_factorization!(
         F.q_eff = q_eff
         return F
     end
+end
+
+# Build the L×L upper-triangular T matrix for the panel of `bs` consecutive
+# Householders ending at column `min(pidx * bs, n)`. Schreiber–van Loan 1989:
+# for H_1, H_2, …, H_L with H_j = I − β_j v_j v_j^*, the product
+# H_1 H_2 … H_L = I − V T V^* where T is upper triangular with T[j,j] = β_j
+# and T[1:j-1, j] = −β_j T[1:j-1, 1:j-1] (V[:,1:j-1]^* v_j).
+#
+# `xt` is a dense scratch sized m2 used to scatter v_i for the sparse-sparse
+# dot products. Must be zero on entry; zeroed at the v_i row pattern after
+# each i's contribution so it stays zero on exit.
+#
+# T_flat is a contiguous (bs × bs × npanels) buffer. Panel pidx's T occupies
+# T_flat[:, :, pidx], with rows/cols beyond L = panel_end - panel_start + 1
+# left unused (the apply only touches T_flat[1:L, 1:L, pidx]).
+@inline function _build_T_panel!(
+        T_flat::Array{T, 3},
+        pidx::Int, bs::Int, n::Int,
+        Vp::Vector{Int}, Vi::Vector{Int},
+        Vx::Vector{T}, beta::Vector{RT},
+        xt::Vector{T}
+    ) where {T, RT}
+    panel_start = (pidx - 1) * bs + 1
+    panel_end = min(pidx * bs, n)
+    L = panel_end - panel_start + 1
+    @inbounds for i in 1:L
+        col_i = panel_start + i - 1
+        beta_i = T(beta[col_i])
+        T_flat[i, i, pidx] = beta_i
+        if i == 1
+            continue
+        end
+        # 1) Scatter v_i into xt.
+        vc1_i = Vp[col_i]; vc2_i = Vp[col_i + 1] - 1
+        for vp in vc1_i:vc2_i
+            xt[Vi[vp]] = Vx[vp]
+        end
+        # 2) For each j in 1..i-1, compute z_j = V[:,col_j]^* v_i via the
+        #    scattered xt. Store directly into T_flat[j, i, pidx].
+        for j in 1:(i - 1)
+            col_j = panel_start + j - 1
+            vc1_j = Vp[col_j]; vc2_j = Vp[col_j + 1] - 1
+            acc = zero(T)
+            @simd for vp in vc1_j:vc2_j
+                acc += conj(Vx[vp]) * xt[Vi[vp]]
+            end
+            T_flat[j, i, pidx] = acc
+        end
+        # 3) Clear xt at v_i's pattern.
+        for vp in vc1_i:vc2_i
+            xt[Vi[vp]] = zero(T)
+        end
+        # 4) T[1:i-1, i] = -beta_i * T[1:i-1, 1:i-1] * z (z stored in
+        #    T_flat[1:i-1, i, pidx]). Process a from 1 to i-1 with an in-place
+        #    update: writing T_flat[a, i, pidx] in iteration a doesn't disturb
+        #    later iterations a' > a, which only read T_flat[l, i, pidx] for
+        #    l ≥ a' > a.
+        for a in 1:(i - 1)
+            acc = zero(T)
+            @simd for l in a:(i - 1)
+                acc += T_flat[a, l, pidx] * T_flat[l, i, pidx]
+            end
+            T_flat[a, i, pidx] = -beta_i * acc
+        end
+    end
+    return nothing
+end
+
+# Compact-WY blocked numeric kernel. Same scatter / build / emit structure as
+# `_csc_qr_numeric!`, but the ereach pattern in s[top..n] is insertion-sorted
+# into column-index order (the WY identity Q = H_1 H_2 … H_L applies in column
+# order), and after each panel of `bs` consecutive Householders completes its
+# T matrix is built into `T_flat[:, :, pidx]`. The apply walks s[top..n] in
+# column-index order; when entering a complete panel that the ereach hits ≥
+# `WY_BLOCK_MIN_HITS` times, the panel is applied as a block (t = V_p^* x;
+# t = T_p^* t; x -= V_p t) instead of one Householder at a time.
+#
+# Uses the pooled workspace buffers (x, s, w, vrows) with the same generation-
+# stamped marker scheme as the unblocked kernel. The WY-specific scratch
+# (T_flat, xt, tvec) is allocated per call — `block_size > 1` is an opt-in
+# path and not required to be zero-allocation.
+function _csc_qr_numeric_wy!(
+        ws::_CSRQRWorkspace{T, RT}, sym::CSRQRSymbolic,
+        tol_use::RT, tol2::RT,
+        F::Union{Nothing, CSRQRFactorization},
+        bs::Int
+    ) where {T, RT}
+    m, n, m2 = sym.m, sym.n, sym.m2
+    parent = sym.parent
+    leftmost = sym.leftmost
+
+    colptr = ws.colptr_S
+    rowval = ws.rowval_S
+    nzval = ws.nzval_S
+
+    # Allocate or reuse V/R/beta output buffers (mirrors _csc_qr_numeric!).
+    if F === nothing
+        Vp = Vector{Int}(undef, n + 1)
+        Vi = Vector{Int}(undef, max(sym.vnz, 1))
+        Vx = Vector{T}(undef, max(sym.vnz, 1))
+        Rp = Vector{Int}(undef, n + 1)
+        Ri = Vector{Int}(undef, max(sym.rnz, 1))
+        Rx = Vector{T}(undef, max(sym.rnz, 1))
+        beta = Vector{RT}(undef, n)
+    else
+        Vp = F.V_colptr; Vi = F.V_rowval; Vx = F.V_nzval
+        Rp = F.R_colptr; Ri = F.R_rowval; Rx = F.R_nzval
+        beta = F.beta
+        if length(Vp) < n + 1
+            resize!(Vp, n + 1); resize!(Rp, n + 1)
+        end
+        if length(Vi) < sym.vnz
+            resize!(Vi, sym.vnz); resize!(Vx, sym.vnz)
+        end
+        if length(Ri) < sym.rnz
+            resize!(Ri, sym.rnz); resize!(Rx, sym.rnz)
+        end
+        if length(beta) < n
+            resize!(beta, n)
+        end
+    end
+
+    x = ws.x
+    s = ws.s
+    w = ws.w
+    vrows = ws.vrows
+    if length(x) < m2
+        resize!(x, m2); fill!(x, zero(T))
+    end
+    if length(vrows) < m2
+        resize!(vrows, m2)
+    end
+    if length(w) < n
+        Lold = length(w)
+        resize!(w, n)
+        @inbounds for j in (Lold + 1):n
+            w[j] = 0
+        end
+    end
+    if length(s) < n
+        resize!(s, n)
+    end
+
+    # WY scratch: T_flat holds every panel's packed T; xt is the dense m2
+    # scatter slot for the T-build sparse-sparse dot products; tvec is the
+    # length-bs intermediate for V_p^* x and T_p^* t.
+    npanels = (n + bs - 1) ÷ bs
+    T_flat = zeros(T, bs, bs, npanels)
+    xt = zeros(T, m2)
+    tvec = Vector{T}(undef, bs)
+
+    Vp[1] = 1
+    Rp[1] = 1
+    rnz_total = 0
+    vnz_total = 0
+    rnk = 0
+    panels_built = 0
+
+    ws.wgen += 1
+    wbase = ws.wgen * (n + 1)
+
+    @inbounds for k in 1:n
+        kstamp = wbase + k
+        # --- 1) ereach + scatter, plus insertion sort into column order.
+        top = n + 1
+        c1 = colptr[k]; c2 = colptr[k + 1] - 1
+        for p in c1:c2
+            i = rowval[p]
+            x[i] = nzval[p]
+            lm = leftmost[i]
+            if lm > 0 && lm <= k
+                len = 0
+                jj = lm
+                while jj != 0 && w[jj] != kstamp && jj < k
+                    s[len + 1] = jj
+                    len += 1
+                    w[jj] = kstamp
+                    jj = parent[jj]
+                end
+                while len > 0
+                    top -= 1
+                    s[top] = s[len]
+                    len -= 1
+                end
+            end
+        end
+        # Insertion-sort s[top..n] in column-index order.
+        if n - top >= 1
+            for ii in (top + 1):n
+                val = s[ii]
+                if s[ii - 1] > val
+                    j = ii - 1
+                    while j >= top && s[j] > val
+                        s[j + 1] = s[j]
+                        j -= 1
+                    end
+                    s[j + 1] = val
+                end
+            end
+        end
+
+        # --- 2) Apply previous Householders, panel-by-panel with WY when the
+        # panel is complete and hits a threshold; else single-H.
+        spos = top
+        while spos <= n
+            p_idx = s[spos]
+            panel_idx = (p_idx - 1) ÷ bs + 1
+            panel_end_full = min(panel_idx * bs, n)
+            if panel_idx <= panels_built
+                spe = spos + 1
+                while spe <= n && s[spe] <= panel_end_full
+                    spe += 1
+                end
+                hits = spe - spos
+                if hits >= WY_BLOCK_MIN_HITS
+                    panel_start = (panel_idx - 1) * bs + 1
+                    L = panel_end_full - panel_start + 1
+                    # t = V_panel^* x
+                    for j in 1:L
+                        pj = panel_start + j - 1
+                        vc1 = Vp[pj]; vc2 = Vp[pj + 1] - 1
+                        tj = zero(T)
+                        @simd for vp in vc1:vc2
+                            tj += conj(Vx[vp]) * x[Vi[vp]]
+                        end
+                        tvec[j] = tj
+                    end
+                    # t = T_p^* t in place.
+                    for i in L:-1:1
+                        acc = zero(T)
+                        @simd for kk in 1:i
+                            acc += conj(T_flat[kk, i, panel_idx]) * tvec[kk]
+                        end
+                        tvec[i] = acc
+                    end
+                    # x -= V_panel * t
+                    for j in 1:L
+                        pj = panel_start + j - 1
+                        tj = tvec[j]
+                        tj == 0 && continue
+                        vc1 = Vp[pj]; vc2 = Vp[pj + 1] - 1
+                        @simd for vp in vc1:vc2
+                            x[Vi[vp]] -= tj * Vx[vp]
+                        end
+                    end
+                    # Emit R for ereach entries in this panel; clear x.
+                    for sp in spos:(spe - 1)
+                        p2 = s[sp]
+                        if rnz_total + 1 > length(Ri)
+                            _grow_pair!(Ri, Rx, rnz_total + 1)
+                        end
+                        rnz_total += 1
+                        Ri[rnz_total] = p2
+                        Rx[rnz_total] = x[p2]
+                        x[p2] = zero(T)
+                    end
+                    spos = spe
+                    continue
+                end
+            end
+            # Single-H apply.
+            vc1 = Vp[p_idx]; vc2 = Vp[p_idx + 1] - 1
+            bk = beta[p_idx]
+            tau = zero(T)
+            @simd for vp in vc1:vc2
+                tau += conj(Vx[vp]) * x[Vi[vp]]
+            end
+            if bk != 0 && tau != 0
+                tau_b = T(bk) * tau
+                @simd for vp in vc1:vc2
+                    x[Vi[vp]] -= tau_b * Vx[vp]
+                end
+            end
+            if rnz_total + 1 > length(Ri)
+                _grow_pair!(Ri, Rx, rnz_total + 1)
+            end
+            rnz_total += 1
+            Ri[rnz_total] = p_idx
+            Rx[rnz_total] = x[p_idx]
+            x[p_idx] = zero(T)
+            spos += 1
+        end
+
+        # --- 2b) Build V[:,k]'s row list.
+        vrows[1] = k
+        vlen = 1
+        for i in (k + 1):m2
+            if x[i] != zero(T)
+                vlen += 1
+                vrows[vlen] = i
+            end
+        end
+
+        # --- 3) Build Householder.
+        nrm2 = zero(RT)
+        for q in 1:vlen
+            nrm2 += abs2(x[vrows[q]])
+        end
+
+        # --- 4) Emit R[k,k] / V[:,k], handle rank-deficient cases.
+        if rnz_total + 1 > length(Ri)
+            _grow_pair!(Ri, Rx, rnz_total + 1)
+        end
+
+        if nrm2 <= tol2 || vlen == 0
+            rnz_total += 1
+            Ri[rnz_total] = k
+            Rx[rnz_total] = zero(T)
+            Rp[k + 1] = rnz_total + 1
+            Vp[k + 1] = vnz_total + 1
+            beta[k] = zero(RT)
+            for q in 1:vlen
+                x[vrows[q]] = zero(T)
+            end
+            if k % bs == 0 || k == n
+                panels_built += 1
+                _build_T_panel!(
+                    T_flat, panels_built, bs, n,
+                    Vp, Vi, Vx, beta, xt
+                )
+            end
+            continue
+        end
+
+        x1 = x[vrows[1]]
+        sgn = if T <: Real
+            x1 >= 0 ? one(T) : -one(T)
+        else
+            x1 == 0 ? one(T) : x1 / abs(x1)
+        end
+        nrm = sqrt(nrm2)
+        alpha = -sgn * nrm
+        v1 = x1 - alpha
+        vnorm2 = abs2(v1) + (nrm2 - abs2(x1))
+
+        if vnorm2 <= zero(RT)
+            rnz_total += 1
+            Ri[rnz_total] = k
+            Rx[rnz_total] = T(alpha)
+            Rp[k + 1] = rnz_total + 1
+            Vp[k + 1] = vnz_total + 1
+            beta[k] = zero(RT)
+            for q in 1:vlen
+                x[vrows[q]] = zero(T)
+            end
+            if abs(alpha) > tol_use
+                rnk += 1
+            end
+            if k % bs == 0 || k == n
+                panels_built += 1
+                _build_T_panel!(
+                    T_flat, panels_built, bs, n,
+                    Vp, Vi, Vx, beta, xt
+                )
+            end
+            continue
+        end
+
+        beta_k = RT(2) / vnorm2
+
+        rnz_total += 1
+        Ri[rnz_total] = k
+        Rx[rnz_total] = T(alpha)
+        Rp[k + 1] = rnz_total + 1
+
+        if vnz_total + vlen > length(Vi)
+            _grow_pair!(Vi, Vx, vnz_total + vlen)
+        end
+        vnz_total += 1
+        Vi[vnz_total] = k
+        Vx[vnz_total] = v1
+        for q in 2:vlen
+            xv = x[vrows[q]]
+            if xv != zero(T)
+                vnz_total += 1
+                Vi[vnz_total] = vrows[q]
+                Vx[vnz_total] = xv
+            end
+        end
+        Vp[k + 1] = vnz_total + 1
+
+        beta[k] = beta_k
+        rnk += 1
+
+        for q in 1:vlen
+            x[vrows[q]] = zero(T)
+        end
+
+        if k % bs == 0 || k == n
+            panels_built += 1
+            _build_T_panel!(
+                T_flat, panels_built, bs, n,
+                Vp, Vi, Vx, beta, xt
+            )
+        end
+    end
+
+    resize!(Vi, vnz_total); resize!(Vx, vnz_total)
+    resize!(Ri, rnz_total); resize!(Rx, rnz_total)
+
+    return _finish_factorization!(
+        F, sym, Vp, Vi, Vx, Rp, Ri, Rx, beta, rnk, tol_use,
+        0, Matrix{T}(undef, 0, 0), T[], sym.q
+    )
 end
 
 # ---------------------------------------------------------------------------
