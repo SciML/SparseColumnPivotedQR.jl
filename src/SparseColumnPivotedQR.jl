@@ -122,13 +122,13 @@ The solve `F \\ b` returns the back-substituted least-squares solution with the 
 `n - rnk` coordinates of the rotated solution set to zero (a "basic" solution; not the
 minimum-norm pseudoinverse solution, but it always satisfies `A x ≈ projection(b, range(A))`).
 """
-function csr_qr(A::SparseMatrixCSR{Bi, T}; tol::Union{Nothing, Real}=nothing) where {Bi, T}
+function csr_qr(A::SparseMatrixCSR{Bi, T}; tol::Union{Nothing, Real} = nothing) where {Bi, T}
     m, n = size(A)
     R_cols, R_vals = _csr_to_rows(A)
 
     Vstep_idx = Vector{Vector{Int}}()
     Vstep_val = Vector{Vector{T}}()
-    tau       = T[]
+    tau = T[]
 
     perm = collect(1:n)
 

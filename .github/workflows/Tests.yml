@@ -36,4 +36,7 @@ jobs:
     with:
       julia-version: "${{ matrix.version }}"
       os: "${{ matrix.os }}"
+      # Disable codecov upload until CODECOV_TOKEN is configured on the repo;
+      # see https://docs.codecov.com/docs/codecov-uploader#using-an-upload-token
+      coverage: false
     secrets: "inherit"
