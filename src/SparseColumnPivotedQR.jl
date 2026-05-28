@@ -3,6 +3,7 @@ module SparseColumnPivotedQR
 using LinearAlgebra
 using SparseArrays
 using SparseMatricesCSR
+using PrecompileTools: @setup_workload, @compile_workload
 
 import LinearAlgebra: ldiv!, rank
 import Base: \, size, eltype
@@ -1810,6 +1811,53 @@ function Base.:\(F::CSRQRFactorization{T}, b::AbstractVector) where {T}
     x = zeros(T, F.n)
     ldiv!(x, F, bb)
     return x
+end
+
+# ---------------------------------------------------------------------------
+# Precompile workload
+# ---------------------------------------------------------------------------
+#
+# Exercise the hot paths (analyze / factor / refactor / solve / rank / size)
+# for the four standard BLAS element types and both index types, on tiny
+# well-conditioned and rank-deficient inputs, so the specialized methods land
+# in the package image. Only the `:natural` ordering is exercised: `:amd`
+# lives in a weak-dep extension and cannot be loaded from here.
+
+@setup_workload begin
+    @compile_workload begin
+        for T in (Float64, Float32, ComplexF64, ComplexF32)
+            for Ti in (Int32, Int64)
+                # Well-conditioned full-rank 6x6: identity + a few off-diagonals.
+                rows = Ti[1, 2, 3, 4, 5, 6, 1, 2, 3, 4]
+                cols = Ti[1, 2, 3, 4, 5, 6, 2, 3, 4, 5]
+                vals = T[4, 4, 4, 4, 4, 4, 1, 1, 1, 1]
+                A = sparsecsr(rows, cols, vals, 6, 6)
+                b = ones(T, 6)
+
+                F = csr_qr(A; ordering = :natural)
+                F \ b
+                rank(F)
+                size(F)
+                size(F, 1)
+
+                # analyze / factor / refactor! round-trip with the same pattern.
+                sym = csr_analyze(A; ordering = :natural)
+                G = csr_factor(A, sym)
+                csr_refactor!(G, A)
+                G \ b
+
+                # Rank-deficient 6x6: column 6 is a copy of column 1 (drop the
+                # identity entry there so the matrix is genuinely rank 5).
+                drows = Ti[1, 2, 3, 4, 5, 1, 2, 3, 4, 6]
+                dcols = Ti[1, 2, 3, 4, 5, 2, 3, 4, 5, 1]
+                dvals = T[4, 4, 4, 4, 4, 1, 1, 1, 1, 4]
+                Ad = sparsecsr(drows, dcols, dvals, 6, 6)
+                Fd = csr_qr(Ad; ordering = :natural)
+                Fd \ b
+                rank(Fd)
+            end
+        end
+    end
 end
 
 end # module
