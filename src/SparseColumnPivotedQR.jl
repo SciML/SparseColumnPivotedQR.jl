@@ -32,6 +32,95 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# Householder gather/scatter inner kernels.
+# ---------------------------------------------------------------------------
+#
+# The per-Householder apply over a sparse column V[:, p] is the rate-limiter
+# of the numeric factor (~60% of factor time on the AMD path). It is a sparse
+# gather/scatter against the dense workspace `x` through the row indices
+# `Vi[vp]`:
+#
+#   tau   = Σ conj(Vx[vp]) * x[Vi[vp]]     (gather dot product)
+#   x[Vi[vp]] -= scale * Vx[vp]            (scatter axpy)
+#
+# `@inbounds` is supplied by the calling `@inbounds for k` block; the indices
+# come from validated CSC structure and `x` is always sized `m2`, so eliding
+# bounds checks here is safe.
+#
+# The optimal annotation differs by element type, measured on the bundled
+# 199×199 test matrices (microbenchmark, ns per full V sweep):
+#
+#                Float64   Float32   ComplexF64  ComplexF32
+#   plain         11.6      11.3       14.8        14.2
+#   @simd         11.0      10.3       14.8        14.1
+#   @simd ivdep   11.0      10.7       19.4 (!)    17.4 (!)
+#   2× unroll      9.8       9.9       17.2        17.1
+#   4× unroll     10.0      10.1       16.5        16.8
+#
+# For real types the manual 2× unroll wins (~10% over @simd). For complex
+# types it regresses badly (the compiler's own complex-mul vectorization is
+# disrupted), and `@simd ivdep` is the worst of all — confirming the earlier
+# WY-experiment observation. So: 2× unroll for real `T`, plain `@simd` for
+# complex `T`, dispatched on `T <: Real`. `ivdep` is never used.
+
+# Gather: tau = Σ conj(Vx[vp]) * x[Vi[vp]] over vp in vc1:vc2.
+@inline function _hh_gather(
+        Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
+        vc1::Int, vc2::Int
+    ) where {T <: Real}
+    tau = zero(T)
+    vp = vc1
+    @inbounds while vp + 1 <= vc2
+        tau += Vx[vp] * x[Vi[vp]] + Vx[vp + 1] * x[Vi[vp + 1]]
+        vp += 2
+    end
+    @inbounds while vp <= vc2
+        tau += Vx[vp] * x[Vi[vp]]
+        vp += 1
+    end
+    return tau
+end
+
+@inline function _hh_gather(
+        Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
+        vc1::Int, vc2::Int
+    ) where {T}
+    tau = zero(T)
+    @inbounds @simd for vp in vc1:vc2
+        tau += conj(Vx[vp]) * x[Vi[vp]]
+    end
+    return tau
+end
+
+# Scatter: x[Vi[vp]] -= scale * Vx[vp] over vp in vc1:vc2.
+@inline function _hh_scatter!(
+        Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
+        vc1::Int, vc2::Int, scale::T
+    ) where {T <: Real}
+    vp = vc1
+    @inbounds while vp + 1 <= vc2
+        x[Vi[vp]] -= scale * Vx[vp]
+        x[Vi[vp + 1]] -= scale * Vx[vp + 1]
+        vp += 2
+    end
+    @inbounds while vp <= vc2
+        x[Vi[vp]] -= scale * Vx[vp]
+        vp += 1
+    end
+    return nothing
+end
+
+@inline function _hh_scatter!(
+        Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
+        vc1::Int, vc2::Int, scale::T
+    ) where {T}
+    @inbounds @simd for vp in vc1:vc2
+        x[Vi[vp]] -= scale * Vx[vp]
+    end
+    return nothing
+end
+
+# ---------------------------------------------------------------------------
 # Symbolic
 # ---------------------------------------------------------------------------
 #
@@ -1225,15 +1314,10 @@ function _csc_qr_numeric!(
             end
             vc1 = Vp[p_idx]; vc2 = Vp[p_idx + 1] - 1
             bk = beta[p_idx]
-            tau = zero(T)
-            @simd for vp in vc1:vc2
-                tau += conj(Vx[vp]) * x[Vi[vp]]
-            end
+            tau = _hh_gather(Vx, Vi, x, vc1, vc2)
             if bk != 0 && tau != 0
                 tau_b = T(bk) * tau
-                @simd for vp in vc1:vc2
-                    x[Vi[vp]] -= tau_b * Vx[vp]
-                end
+                _hh_scatter!(Vx, Vi, x, vc1, vc2, tau_b)
             end
             # Emit R[p_idx, k] = x[p_idx]; clear x[p_idx].
             if rnz_total + 1 > length(Ri)
@@ -1492,15 +1576,10 @@ function _csc_qr_numeric!(
             p_idx > ks && continue
             vc1 = Vp[p_idx]; vc2 = Vp[p_idx + 1] - 1
             bk = beta[p_idx]
-            tau = zero(T)
-            @simd for vp in vc1:vc2
-                tau += conj(Vx[vp]) * x[Vi[vp]]
-            end
+            tau = _hh_gather(Vx, Vi, x, vc1, vc2)
             if bk != 0 && tau != 0
                 tau_b = T(bk) * tau
-                @simd for vp in vc1:vc2
-                    x[Vi[vp]] -= tau_b * Vx[vp]
-                end
+                _hh_scatter!(Vx, Vi, x, vc1, vc2, tau_b)
             end
             # Emit into top_R[p_idx, jj]; clear x[p_idx].
             top_R[p_idx, jj] = x[p_idx]
@@ -1648,17 +1727,12 @@ function _apply_QH!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
         bk == 0 && continue
         vc1 = Vp[k]; vc2 = Vp[k + 1] - 1
         vc2 < vc1 && continue
-        tau = zero(T)
-        @simd for vp in vc1:vc2
-            tau += conj(Vx[vp]) * work[Vi[vp]]
-        end
+        tau = _hh_gather(Vx, Vi, work, vc1, vc2)
         if tau == 0
             continue
         end
         tau_b = T(bk) * tau
-        @simd for vp in vc1:vc2
-            work[Vi[vp]] -= tau_b * Vx[vp]
-        end
+        _hh_scatter!(Vx, Vi, work, vc1, vc2, tau_b)
     end
     if ks > 0
         # Apply dense Householders to work[ks+1 .. ks+m_active] via LAPACK.
@@ -1692,17 +1766,12 @@ function _apply_Q!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
         bk == 0 && continue
         vc1 = Vp[k]; vc2 = Vp[k + 1] - 1
         vc2 < vc1 && continue
-        tau = zero(T)
-        @simd for vp in vc1:vc2
-            tau += conj(Vx[vp]) * work[Vi[vp]]
-        end
+        tau = _hh_gather(Vx, Vi, work, vc1, vc2)
         if tau == 0
             continue
         end
         tau_b = T(bk) * tau
-        @simd for vp in vc1:vc2
-            work[Vi[vp]] -= tau_b * Vx[vp]
-        end
+        _hh_scatter!(Vx, Vi, work, vc1, vc2, tau_b)
     end
     return work
 end
