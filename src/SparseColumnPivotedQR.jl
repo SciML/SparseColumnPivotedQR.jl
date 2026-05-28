@@ -57,17 +57,23 @@ end
 #   2× unroll      9.8       9.9       17.2        17.1
 #   4× unroll     10.0      10.1       16.5        16.8
 #
-# For real types the manual 2× unroll wins (~10% over @simd). For complex
-# types it regresses badly (the compiler's own complex-mul vectorization is
-# disrupted), and `@simd ivdep` is the worst of all — confirming the earlier
-# WY-experiment observation. So: 2× unroll for real `T`, plain `@simd` for
-# complex `T`, dispatched on `T <: Real`. `ivdep` is never used.
+# For the hardware floats the manual 2× unroll wins (~10-20% over @simd). For
+# complex types it regresses badly (the compiler's own complex-mul
+# vectorization is disrupted), and `@simd ivdep` is the worst of all —
+# confirming the earlier WY-experiment observation.
+#
+# The unroll is gated to `Union{Float32, Float64}` rather than all `T <: Real`:
+# `@simd` can't vectorize non-hardware reals (heap-allocated `BigFloat`,
+# composite `ForwardDiff.Dual`) anyway, and there the `a*b + c*d` paired form
+# only materializes extra temporaries — measured a mild regression (~+4% on
+# BigFloat, ~+10% on `Dual{,2}` at the kernel level). So those (and complex)
+# take the plain `@simd` + `conj` path. `ivdep` is never used.
 
 # Gather: tau = Σ conj(Vx[vp]) * x[Vi[vp]] over vp in vc1:vc2.
 @inline function _hh_gather(
         Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
         vc1::Int, vc2::Int
-    ) where {T <: Real}
+    ) where {T <: Union{Float32, Float64}}
     tau = zero(T)
     vp = vc1
     @inbounds while vp + 1 <= vc2
@@ -96,7 +102,7 @@ end
 @inline function _hh_scatter!(
         Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
         vc1::Int, vc2::Int, scale::T
-    ) where {T <: Real}
+    ) where {T <: Union{Float32, Float64}}
     vp = vc1
     @inbounds while vp + 1 <= vc2
         x[Vi[vp]] -= scale * Vx[vp]
