@@ -17,6 +17,13 @@ export csr_qr, csr_analyze, csr_factor, csr_refactor!,
     return Bi == 1 ? 0 : 1
 end
 
+# The adaptive-dense fallback finishes the trailing dense block with LAPACK
+# `geqp3!` / `ormqr!`, which are only defined for the four BLAS float types
+# (Float32/Float64/ComplexF32/ComplexF64). For any other element type (e.g.
+# `BigFloat` or `ForwardDiff.Dual`) the dense path is unavailable, so we
+# transparently ignore `adaptive_dense` and run the pure-Julia sparse kernel.
+@inline _is_blas_eltype(::Type{T}) where {T} = T <: LinearAlgebra.BlasFloat
+
 # Grow a (rowval, nzval) pair so that both have at least `needed` capacity.
 # Used by the numeric kernel to expand V/R output buffers if the symbolic
 # bound was undershot.
@@ -1085,6 +1092,12 @@ function _csc_qr_numeric!(
     ) where {T, RT}
     drop_active = drop_tol > zero(RT)
     drop_tol2 = drop_tol * drop_tol
+    # The dense fallback relies on LAPACK geqp3!/ormqr!, which exist only for
+    # BLAS float types. For generic T (e.g. BigFloat, ForwardDiff.Dual) just run
+    # the pure-Julia sparse kernel to completion.
+    if adaptive_dense && !_is_blas_eltype(T)
+        adaptive_dense = false
+    end
     m, n, m2 = sym.m, sym.n, sym.m2
     parent = sym.parent
     leftmost = sym.leftmost

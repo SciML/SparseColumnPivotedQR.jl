@@ -5,6 +5,7 @@ using SparseMatricesCSR
 using Random
 using SparseColumnPivotedQR
 using AMD  # trigger AMD extension
+using ForwardDiff
 
 # helper: convert CSC -> CSR
 to_csr(A::SparseMatrixCSC) = SparseMatrixCSR(transpose(sparse(transpose(A))))
@@ -684,6 +685,119 @@ end
             end
         else
             @info "User matrix directory not available; skipping."
+        end
+    end
+
+    @testset "Generic number types" begin
+        @testset "BigFloat full-rank square solve" begin
+            setprecision(BigFloat, 256) do
+                n = 12
+                # Well-conditioned BigFloat matrix (diagonally dominant).
+                Adense = Matrix{BigFloat}(undef, n, n)
+                for i in 1:n, j in 1:n
+                    Adense[i, j] = BigFloat(1) / BigFloat(i + j)
+                end
+                Adense += BigFloat(n) * I
+                Acsr = build_csr(Adense)
+                b = BigFloat[BigFloat(i) / 3 for i in 1:n]
+                F = csr_qr(Acsr)
+                @test eltype(F) == BigFloat
+                @test rank(F) == n
+                x = F \ b
+                @test eltype(x) == BigFloat
+                # Residual must reach BigFloat precision: if any Float64
+                # truncation leaked in, this would stall near 1e-16.
+                @test norm(Adense * x - b) / norm(b) < BigFloat(1.0e-30)
+            end
+        end
+
+        @testset "BigFloat rank-deficient" begin
+            setprecision(BigFloat, 256) do
+                # Rank-3 6x5 BigFloat matrix.
+                U = BigFloat[BigFloat(i)^j for i in 1:6, j in 1:3]
+                Vm = BigFloat[BigFloat(i)^j for i in 1:5, j in 1:3]
+                Adense = U * Vm'
+                Acsr = build_csr(Adense)
+                b = BigFloat[BigFloat(i) / 2 for i in 1:6]
+                tol = BigFloat(1.0e-40)
+                F = csr_qr(Acsr; tol = tol)
+                @test rank(F) == 3
+                x = F \ b
+                @test all(isfinite, x)
+                # Minimum residual reference. LAPACK pinv/svd is unavailable
+                # for BigFloat, so compute the LS minimum-residual norm in
+                # Float64 (the residual norm is well-conditioned for this
+                # benign rank-3 case) and compare against the BigFloat solve's
+                # residual. The BigFloat residual must not exceed the minimum.
+                xref = pinv(Float64.(Adense)) * Float64.(b)
+                rref = norm(Float64.(Adense) * xref - Float64.(b))
+                rres = Float64(norm(Adense * x - b))
+                @test rres ≈ rref atol = 1.0e-8
+            end
+        end
+
+        @testset "ForwardDiff.Dual solve matches primal" begin
+            Random.seed!(101)
+            n = 8
+            base = randn(n, n) + 4 * I
+            # Parameterized matrix: A(p) keeps a fixed sparsity pattern, only
+            # the values are Dual.
+            mask = base .!= 0
+            makeA(p) = build_csr(base .* p[1] .+ p[2] .* mask)
+            b = randn(n)
+            p0 = [1.3, 0.2]
+
+            # Primal Float64 solve.
+            xprimal = csr_qr(makeA(p0)) \ b
+
+            solve(p) = csr_qr(makeA(p)) \ b
+            xdual = solve(ForwardDiff.Dual.(p0, (1.0, 0.0)))
+            @test ForwardDiff.value.(xdual) ≈ xprimal rtol = 1.0e-10
+
+            # Jacobian of solution wrt p vs finite differences.
+            J = ForwardDiff.jacobian(solve, p0)
+            h = 1.0e-6
+            Jfd = similar(J)
+            for k in 1:length(p0)
+                pp = copy(p0); pm = copy(p0)
+                pp[k] += h; pm[k] -= h
+                Jfd[:, k] = (solve(pp) .- solve(pm)) ./ (2h)
+            end
+            @test J ≈ Jfd rtol = 1.0e-6 atol = 1.0e-6
+        end
+
+        @testset "adaptive_dense falls back for non-BLAS eltype" begin
+            # BigFloat: adaptive_dense must be silently ignored (fallback to
+            # the pure-Julia sparse kernel), producing a correct solve.
+            setprecision(BigFloat, 256) do
+                n = 40
+                Adense = Matrix{BigFloat}(undef, n, n)
+                for i in 1:n, j in 1:n
+                    Adense[i, j] = BigFloat(1) / BigFloat(i + 2j)
+                end
+                Adense += BigFloat(n) * I
+                Acsr = build_csr(Adense)
+                b = BigFloat[BigFloat(i) for i in 1:n]
+                F = csr_qr(Acsr; adaptive_dense = true)
+                @test F.k_dense == 0   # no dense transition occurred
+                x = F \ b
+                @test norm(Adense * x - b) / norm(b) < BigFloat(1.0e-30)
+            end
+
+            # ForwardDiff.Dual: same fallback behavior, value correct.
+            Random.seed!(202)
+            n = 24
+            base = randn(n, n) + 6 * I
+            mask = base .!= 0
+            makeA(p) = build_csr(base .* p[1] .+ p[2] .* mask)
+            b = randn(n)
+            p0 = [1.1, 0.3]
+            solve(p) = csr_qr(makeA(p); adaptive_dense = true) \ b
+            xprimal = csr_qr(makeA(p0)) \ b
+            xdual = solve(ForwardDiff.Dual.(p0, (1.0, 0.0)))
+            @test ForwardDiff.value.(xdual) ≈ xprimal rtol = 1.0e-10
+            Fdual = csr_qr(makeA(ForwardDiff.Dual.(p0, (1.0, 0.0))); adaptive_dense = true)
+            @test Fdual.k_dense == 0
         end
     end
 
