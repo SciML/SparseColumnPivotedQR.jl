@@ -35,13 +35,15 @@ catch
     false
 end
 
-# Prefer the matrices bundled with the test suite; fall back to the original
-# upload location if present (developer convenience).
 const BUNDLED = abspath(joinpath(@__DIR__, "..", "test", "matrices"))
 const UPLOADS = "/home/crackauc/.claude/uploads/d279ff12-71e6-4faf-b1ac-6715899a256b"
-const MATDIR = isdir(BUNDLED) ? BUNDLED : UPLOADS
-files = isdir(MATDIR) ?
-    sort(filter(f -> endswith(f, ".txt"), readdir(MATDIR; join = true))) : String[]
+files = if isdir(BUNDLED)
+    sort(filter(f -> endswith(f, ".txt"), readdir(BUNDLED; join = true)))
+elseif isdir(UPLOADS)
+    sort(readdir(UPLOADS; join = true))
+else
+    String[]
+end
 
 function load_case(f)
     text = read(f, String)
@@ -74,7 +76,18 @@ for f in files
     Adense = Matrix(A)
     short = first(basename(f), 28)
 
-    # 1) SparseColumnPivotedQR — natural ordering, one-shot csr_qr
+    # 0) SparseColumnPivotedQR — default ordering (:amd when AMD loaded,
+    # which it is here). This is what the common convenience entry point
+    # `csr_qr(A)` does without an explicit ordering=.
+    F = csr_qr(Acsr); x = F \ b
+    t = @benchmark begin
+        F2 = csr_qr($Acsr); $x .= F2 \ $b
+    end seconds = 1
+    res = all(isfinite, x) ? norm(A * x - b) : NaN
+    nn = count(!isfinite, x)
+    fmt_row(short, "CSR-QR default", minimum(t.times) / 1000, res, nn)
+
+    # 1) SparseColumnPivotedQR — natural ordering (opt-in), one-shot csr_qr
     F = csr_qr(Acsr; ordering = :natural); x = F \ b
     t = @benchmark begin
         F2 = csr_qr($Acsr; ordering = :natural); $x .= F2 \ $b
@@ -91,6 +104,15 @@ for f in files
     res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
     fmt_row(short, "CSR-QR amd", minimum(t.times) / 1000, res, nn)
+
+    # 2b) SparseColumnPivotedQR — adaptive ordering, one-shot csr_qr
+    F = csr_qr(Acsr; ordering = :adaptive); x = F \ b
+    t = @benchmark begin
+        F2 = csr_qr($Acsr; ordering = :adaptive); $x .= F2 \ $b
+    end seconds = 1
+    res = all(isfinite, x) ? norm(A * x - b) : NaN
+    nn = count(!isfinite, x)
+    fmt_row(short, "CSR-QR adaptive", minimum(t.times) / 1000, res, nn)
 
     # 3) SparseColumnPivotedQR — refactor! reusing natural symbolic
     sym = csr_analyze(Acsr; ordering = :natural)

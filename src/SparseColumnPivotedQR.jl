@@ -8,6 +8,7 @@ import LinearAlgebra: ldiv!, rank
 import Base: \, size, eltype
 
 export csr_qr, csr_analyze, csr_factor, csr_refactor!,
+    has_amd_extension,
     CSRQRSymbolic, CSRQRFactorization
 
 # CSR offset: rowptr stores 1-based if Bi == 1, 0-based if Bi == 0.
@@ -307,6 +308,67 @@ end
 # Default no-op AMD hook; overridden by the AMD.jl extension.
 _amd_colperm(rowptr, colval, m, n) = collect(1:n)
 
+# Set to `true` by the AMD.jl extension on `__init__`. Lets `csr_analyze` /
+# `csr_qr` resolve the default ordering (`:default`) to `:amd` only when the
+# extension is actually loaded, falling back to `:natural` otherwise. Using a
+# Ref so it can be flipped from the extension at load time.
+const _AMD_EXT_LOADED = Ref(false)
+
+"""
+    has_amd_extension() -> Bool
+
+Returns `true` iff the `AMD.jl` extension has been loaded into the current
+session (i.e. `using AMD` has been executed). The default ordering
+`:default` resolves to `:amd` only when this is `true`, falling back to
+`:natural` otherwise.
+"""
+has_amd_extension() = _AMD_EXT_LOADED[]
+
+# Resolve `:default` to `:amd` when the AMD extension is loaded, `:natural`
+# otherwise. All other symbols pass through.
+@inline function _resolve_ordering(ordering::Symbol)
+    if ordering === :default
+        return _AMD_EXT_LOADED[] ? :amd : :natural
+    end
+    return ordering
+end
+
+# Cheap fill estimator: total depth of the column elimination tree (sum
+# over k of distance from k to root). Mirrors what the apply step pays —
+# deeper chain → more Householders touched per column. O(n) thanks to
+# the bottom-up recursion using a `depth` cache.
+function _etree_total_depth(parent::Vector{Int})
+    n = length(parent)
+    depth = zeros(Int, n)
+    total = 0
+    @inbounds for k in 1:n
+        # parent[k] is always > k (etree of column k has children with
+        # smaller indices). Walk up; cache depths so each node is touched
+        # once. Equivalent to the recursive depth function with memoisation.
+        if depth[k] == 0
+            # depth from k to root, computed via iteration with stack-free
+            # caching: walk to a node whose depth is known, then assign
+            # depths back along the path.
+            j = k
+            len = 0
+            while j != 0 && depth[j] == 0
+                len += 1
+                j = parent[j]
+            end
+            base = j == 0 ? 0 : depth[j]
+            j = k
+            d = base + len
+            while j != 0 && depth[j] == 0
+                depth[j] = d
+                d -= 1
+                j = parent[j]
+            end
+        end
+        total += depth[k]
+    end
+    return total
+end
+
 function _build_symbolic(
         rowptr::Vector{Int}, colval::Vector{Int},
         m::Int, n::Int, ordering::Symbol
@@ -479,7 +541,7 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    csr_analyze(A::SparseMatrixCSR; ordering=:natural) -> CSRQRSymbolic
+    csr_analyze(A::SparseMatrixCSR; ordering=:default) -> CSRQRSymbolic
 
 Symbolic analysis phase for the sparse column-pivoted Householder QR
 factorization. Computes the column permutation `q`, row permutation `pinv`,
@@ -487,26 +549,75 @@ column elimination tree, per-row `leftmost`, and the upper-bound sizes of
 the V (Householder) and R buffers.
 
 `ordering` selects the column ordering:
-  * `:natural` — identity ordering (default; best on dense-fill matrices).
-  * `:amd`     — AMD on AᵀA (requires `using AMD` to enable the extension).
-  * `:colamd`  — alias for `:amd`.
+  * `:default`  — `:amd` if the AMD.jl extension is loaded (`using AMD`),
+                  `:natural` otherwise. **This is the default.**
+  * `:natural`  — identity ordering (opt-in; usually slower than `:amd` on
+                  dense-fill matrices because the column etree degenerates
+                  to a chain).
+  * `:amd`      — AMD on AᵀA (requires `using AMD` to enable the extension;
+                  throws an `ArgumentError` otherwise).
+  * `:colamd`   — alias for `:amd`.
+  * `:adaptive` — compute both `:amd` and `:natural` symbolics, pick the
+                  one with the smaller column-etree total depth (which
+                  bounds total apply work). Requires AMD; ~140 µs extra
+                  symbolic overhead vs `:amd` alone.
 
 Returns a `CSRQRSymbolic` that can be passed to `csr_factor` and reused via
 `csr_refactor!` for matrices with identical sparsity patterns.
 """
-function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol = :natural) where {Bi}
+function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol = :default) where {Bi}
     m, n = size(A)
     rowptr, colval = _capture_pattern(A)
+    ordering_use = _resolve_ordering(ordering)
+    if (
+            ordering_use === :amd || ordering_use === :colamd ||
+                ordering_use === :adaptive
+        ) && !_AMD_EXT_LOADED[]
+        throw(
+            ArgumentError(
+                "ordering=:$ordering_use requires the AMD.jl extension; load it via `using AMD`"
+            )
+        )
+    end
+
+    if ordering_use === :adaptive
+        # Build both candidate symbolics, compare predicted apply work via
+        # the column-etree total depth, keep the cheaper one. AMD's etree
+        # is branched and typically shallower; on already-well-ordered
+        # matrices natural can win and we fall back to it.
+        q_a, pinv_a, parent_a, leftmost_a, m2_a, vnz_a, rnz_a =
+            _build_symbolic(rowptr, colval, m, n, :amd)
+        q_n, pinv_n, parent_n, leftmost_n, m2_n, vnz_n, rnz_n =
+            _build_symbolic(rowptr, colval, m, n, :natural)
+        d_a = _etree_total_depth(parent_a)
+        d_n = _etree_total_depth(parent_n)
+        # Tiebreaker prefers :natural: cheaper symbolic, and on shallow
+        # etrees the apply-step difference is in the noise.
+        if d_a < d_n
+            return CSRQRSymbolic(
+                m, n, m2_a, q_a, pinv_a, parent_a,
+                leftmost_a, vnz_a, rnz_a, :amd,
+                rowptr, colval
+            )
+        else
+            return CSRQRSymbolic(
+                m, n, m2_n, q_n, pinv_n, parent_n,
+                leftmost_n, vnz_n, rnz_n, :natural,
+                rowptr, colval
+            )
+        end
+    end
+
     q, pinv, parent, leftmost_perm, m2, vnz, rnz =
-        _build_symbolic(rowptr, colval, m, n, ordering)
+        _build_symbolic(rowptr, colval, m, n, ordering_use)
     return CSRQRSymbolic(
         m, n, m2, q, pinv, parent, leftmost_perm,
-        vnz, rnz, ordering, rowptr, colval
+        vnz, rnz, ordering_use, rowptr, colval
     )
 end
 
 """
-    csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing) -> CSRQRFactorization
+    csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing, drop_tol=0) -> CSRQRFactorization
 
 Numeric factorization given a `CSRQRSymbolic`. Implements the Davis
 `cs_qr` algorithm (scatter–apply–emit on a dense workspace) with the V/R
@@ -517,47 +628,67 @@ Columns whose post-Householder diagonal magnitude falls below `tol` are
 flagged as rank-deficient: `V[:,k] = 0`, `β_k = 0`, `R[k,k] = 0`. The
 numerical rank is the count of columns whose diagonal magnitude is above
 threshold.
+
+`drop_tol=0` (default) keeps every nonzero in each Householder vector
+`V[:, k]`. Setting `drop_tol > 0` discards entries with
+`|v_i| <= drop_tol * ‖v‖` and recomputes `β_k` for the truncated vector;
+the resulting factorization is an *approximate* QR (residual `‖A x - b‖`
+grows with `drop_tol`) but subsequent `apply_QH` / `apply_Q` over fewer
+nonzeros becomes cheaper. Typical safe values are `1e-12` to `1e-8` —
+larger values trade accuracy for fill.
 """
 function csr_factor(
         A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
-        tol::Union{Nothing, Real} = nothing
+        tol::Union{Nothing, Real} = nothing,
+        drop_tol::Real = 0
     ) where {Bi, T}
-    return _factor_kernel(A, sym, tol)
+    return _factor_kernel(A, sym, tol, real(T)(drop_tol))
 end
 
 """
-    csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:natural) -> CSRQRFactorization
+    csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:default) -> CSRQRFactorization
 
 One-shot convenience: equivalent to `csr_factor(A, csr_analyze(A; ordering); tol)`.
+
+When `ordering=:default` (the default), the column ordering is `:amd` if the
+AMD.jl extension is loaded (`using AMD`) and `:natural` otherwise. On the
+typical dense-fill matrices that arise from nonlinear solver linsolves,
+`:amd` roughly halves the factor time. Pass `ordering=:natural` to opt out
+for matrices whose columns are already well-ordered.
 """
 function csr_qr(
         A::SparseMatrixCSR{Bi, T};
         tol::Union{Nothing, Real} = nothing,
-        ordering::Symbol = :natural
+        ordering::Symbol = :default,
+        drop_tol::Real = 0
     ) where {Bi, T}
     sym = csr_analyze(A; ordering = ordering)
-    return csr_factor(A, sym; tol = tol)
+    return csr_factor(A, sym; tol = tol, drop_tol = drop_tol)
 end
 
 """
-    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing) -> CSRQRFactorization
+    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing, drop_tol=0) -> CSRQRFactorization
 
 Numeric refactorization. If the sparsity pattern of `A` matches the one
 captured in `F.sym`, the symbolic is reused (skipping the etree / `pinv` /
 `leftmost` work). Otherwise a fresh analyze+factor is performed.
+
+The `drop_tol` keyword has the same meaning as in [`csr_factor`](@ref).
 
 Returns a fresh `CSRQRFactorization` (the original is unchanged).
 """
 function csr_refactor!(
         F::CSRQRFactorization{T},
         A::SparseMatrixCSR{Bi};
-        tol::Union{Nothing, Real} = nothing
+        tol::Union{Nothing, Real} = nothing,
+        drop_tol::Real = 0
     ) where {T, Bi}
+    dt = real(T)(drop_tol)
     if _pattern_matches(F.sym, A)
-        return _factor_kernel(A, F.sym, tol)
+        return _factor_kernel(A, F.sym, tol, dt)
     else
         sym = csr_analyze(A; ordering = F.sym.ordering)
-        return _factor_kernel(A, sym, tol)
+        return _factor_kernel(A, sym, tol, dt)
     end
 end
 
@@ -567,7 +698,8 @@ end
 
 function _factor_kernel(
         A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
-        tol::Union{Nothing, Real}
+        tol::Union{Nothing, Real},
+        drop_tol::Real = zero(real(T))
     ) where {Bi, T}
     m, n = size(A)
     (m == sym.m && n == sym.n) ||
@@ -597,7 +729,10 @@ function _factor_kernel(
     colptr_S, rowval_S, nzval_S =
         _permute_pq(colptr_A, rowval_A, nzval_A, sym_use.pinv, sym_use.q, m, n)
 
-    return _csc_qr_numeric(colptr_S, rowval_S, nzval_S, sym_use, tol_use, tol2)
+    return _csc_qr_numeric(
+        colptr_S, rowval_S, nzval_S, sym_use,
+        tol_use, tol2, RT(drop_tol)
+    )
 end
 
 # CSR -> CSC of A, plus per-column squared norms and total ||A||_F^2. The
@@ -802,8 +937,11 @@ end
 function _csc_qr_numeric(
         colptr::Vector{Int}, rowval::Vector{Int},
         nzval::Vector{T}, sym::CSRQRSymbolic,
-        tol_use::RT, tol2::RT
+        tol_use::RT, tol2::RT,
+        drop_tol::RT = zero(RT)
     ) where {T, RT}
+    drop_active = drop_tol > zero(RT)
+    drop_tol2 = drop_tol * drop_tol
     m, n, m2 = sym.m, sym.n, sym.m2
     parent = sym.parent
     leftmost = sym.leftmost
@@ -979,6 +1117,12 @@ function _csc_qr_numeric(
         # Skipping exact zeros keeps V columns numerically sparse: rows marked
         # by the apply-step row-tracking but cancelled to 0 by Householder
         # arithmetic don't pollute future apply walks.
+        #
+        # If `drop_tol > 0` is in effect we additionally drop entries
+        # j >= 2 whose magnitude satisfies |x[vrows[q]]|^2 <= drop_tol^2 *
+        # vnorm2, and then recompute β_k from the surviving |v|^2 so that
+        # H̃ = I - β̃ ṽ ṽ^T remains a proper Householder of the truncated ṽ.
+        # The diagonal v1 is never dropped.
         if vnz_total + vlen > length(Vi)
             _grow_csc!(V, vnz_total + vlen)
             Vi = V.rowval; Vx = V.nzval
@@ -986,12 +1130,27 @@ function _csc_qr_numeric(
         vnz_total += 1
         Vi[vnz_total] = k
         Vx[vnz_total] = v1
-        for q in 2:vlen
-            xv = x[vrows[q]]
-            if xv != zero(T)
-                vnz_total += 1
-                Vi[vnz_total] = vrows[q]
-                Vx[vnz_total] = xv
+        if drop_active
+            thr_drop2 = drop_tol2 * vnorm2
+            new_vnorm2 = abs2(v1)
+            for q in 2:vlen
+                xv = x[vrows[q]]
+                if xv != zero(T) && abs2(xv) > thr_drop2
+                    vnz_total += 1
+                    Vi[vnz_total] = vrows[q]
+                    Vx[vnz_total] = xv
+                    new_vnorm2 += abs2(xv)
+                end
+            end
+            beta_k = RT(2) / new_vnorm2
+        else
+            for q in 2:vlen
+                xv = x[vrows[q]]
+                if xv != zero(T)
+                    vnz_total += 1
+                    Vi[vnz_total] = vrows[q]
+                    Vx[vnz_total] = xv
+                end
             end
         end
         Vp[k + 1] = vnz_total + 1

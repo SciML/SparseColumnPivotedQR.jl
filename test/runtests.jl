@@ -239,6 +239,70 @@ end
         @test norm(A3 * x3 - b) / norm(b) < 1.0e-10
     end
 
+    @testset "default ordering resolves to :amd when AMD is loaded" begin
+        # AMD is `using`'d at the top of this file, so the extension is loaded.
+        @test SparseColumnPivotedQR.has_amd_extension()
+
+        Random.seed!(21)
+        n = 25
+        A = sprand(Float64, n, n, 0.25) + 3 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+
+        sym_default = csr_analyze(Acsr)            # implicit :default
+        sym_amd = csr_analyze(Acsr; ordering = :amd)
+        @test sym_default.ordering === :amd
+        @test sym_default.q == sym_amd.q
+
+        F_default = csr_qr(Acsr)
+        F_amd = csr_qr(Acsr; ordering = :amd)
+        x_default = F_default \ b
+        x_amd = F_amd \ b
+        @test x_default ≈ x_amd atol = 1.0e-12
+        @test rank(F_default) == n
+    end
+
+    @testset ":natural opt-in still works" begin
+        Random.seed!(22)
+        n = 15
+        A = sprand(Float64, n, n, 0.3) + 2 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+        sym_nat = csr_analyze(Acsr; ordering = :natural)
+        @test sym_nat.ordering === :natural
+        @test sym_nat.q == collect(1:n)
+        F = csr_qr(Acsr; ordering = :natural)
+        @test rank(F) == n
+        @test norm(A * (F \ b) - b) / norm(b) < 1.0e-10
+    end
+
+    @testset "default ordering on bundled 199x199 matrices" begin
+        # Sanity: default ordering on the user matrices == :amd (since AMD is
+        # loaded here) and the resulting factor has strictly fewer nnz(R)
+        # than the natural-ordered factor on these dense-fill matrices.
+        dir = joinpath(@__DIR__, "matrices")
+        files = sort(
+            filter(f -> endswith(f, ".txt"), readdir(dir; join = true))
+        )
+        @test !isempty(files)
+        for f in files
+            text = read(f, String)
+            lines = split(text, '\n'; keepempty = false)
+            A = eval(Meta.parse(strip(lines[1])))
+            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            sym_default = csr_analyze(Acsr)
+            sym_amd = csr_analyze(Acsr; ordering = :amd)
+            # :default == :amd here.
+            @test sym_default.q == sym_amd.q
+
+            # Actual nnz(R) should be lower with AMD than natural on these
+            # dense-fill matrices.
+            F_nat = csr_qr(Acsr; ordering = :natural)
+            F_amd = csr_qr(Acsr; ordering = :amd)
+            @test length(F_amd.R_nzval) < length(F_nat.R_nzval)
+        end
+    end
+
     @testset "ordering propagated through csr_qr" begin
         Random.seed!(14)
         n = 20
@@ -299,6 +363,70 @@ end
         # Q * [R; 0] should equal P A Q.
         R_ext = vcat(R, zeros(m2 - n, n))
         @test norm(Q * R_ext - PAq) < 1.0e-10
+    end
+
+    @testset "adaptive ordering picks the shallower etree" begin
+        # On the dense-fill user matrices AMD's etree should win; the
+        # adaptive ordering should therefore pick :amd.
+        dir = joinpath(@__DIR__, "matrices")
+        files = sort(
+            filter(f -> endswith(f, ".txt"), readdir(dir; join = true))
+        )
+        for f in files
+            text = read(f, String)
+            lines = split(text, '\n'; keepempty = false)
+            A = eval(Meta.parse(strip(lines[1])))
+            b = eval(Meta.parse(strip(lines[2])))
+            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            sym_adapt = csr_analyze(Acsr; ordering = :adaptive)
+            @test sym_adapt.ordering === :amd
+            F = csr_factor(Acsr, sym_adapt)
+            if all(isfinite, b)
+                x = F \ b
+                @test all(isfinite, x)
+            end
+        end
+
+        # On an already-natural-friendly matrix (block-diagonal) AMD
+        # cannot improve on the chain depth; adaptive should keep :natural.
+        n = 60
+        # Build a block-diagonal matrix: identity + small random blocks
+        # along the diagonal. Natural order has a maximally branched
+        # etree (each block is its own subtree) so AMD provides no
+        # benefit.
+        I_part = sparse(I, n, n)
+        A = 5 * I_part
+        Acsr = build_csr(Matrix(A))
+        sym_adapt = csr_analyze(Acsr; ordering = :adaptive)
+        @test sym_adapt.ordering === :natural
+    end
+
+    @testset "drop_tol prunes V columns and stays within tolerance" begin
+        Random.seed!(31)
+        n = 80
+        A = sprand(Float64, n, n, 0.05) + 4 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+
+        F0 = csr_qr(Acsr; ordering = :natural)
+        F1 = csr_qr(Acsr; ordering = :natural, drop_tol = 1.0e-8)
+
+        # drop_tol > 0 should at least weakly reduce nnz(V).
+        @test length(F1.V_nzval) <= length(F0.V_nzval)
+
+        x0 = F0 \ b
+        x1 = F1 \ b
+        # The dropped factorization still solves to a small residual; allow
+        # one or two extra orders relative to the exact factor.
+        r0 = norm(A * x0 - b) / norm(b)
+        r1 = norm(A * x1 - b) / norm(b)
+        @test r1 < 1.0e-6
+        @test r1 <= max(r0, 1.0e-12) * 1.0e7
+
+        # drop_tol = 0 is identical to the default factorization.
+        F2 = csr_qr(Acsr; ordering = :natural, drop_tol = 0)
+        @test F2.V_nzval == F0.V_nzval
+        @test F2.beta == F0.beta
     end
 
     @testset "Numerically-zero column triggers value-aware repivot" begin

@@ -4,7 +4,7 @@ SparseColumnPivotedQR.jl is a component of the
 [SciML](https://sciml.ai/) ecosystem providing a pure-Julia,
 rank-revealing, column-pivoted Householder QR factorization that operates
 directly on
-[`SparseMatrixCSR`](https://github.com/JuliaSmoothOptimizers/SparseMatricesCSR.jl)
+[`SparseMatrixCSR`](https://github.com/gridap/SparseMatricesCSR.jl)
 sparse matrices.
 
 The package targets the same "small-to-medium sparse" niche as KLU does for
@@ -24,6 +24,7 @@ Pkg.add("SparseColumnPivotedQR")
 
 ```julia
 using SparseArrays, SparseMatricesCSR, SparseColumnPivotedQR
+using AMD  # enables the recommended AMD column ordering
 
 # A 5×5 sparse matrix and a right-hand side.
 A_csc = sparse([1.0  0   2   0   0;
@@ -40,6 +41,48 @@ x = F \ b
 
 # Rank and dimensions.
 rank(F), size(F)
+```
+
+## Column ordering
+
+`csr_qr` / `csr_analyze` accept an `ordering` keyword. Available choices:
+
+| ordering    | meaning                                                              |
+|-------------|----------------------------------------------------------------------|
+| `:default`  | **(default)** `:amd` when the AMD.jl extension is loaded, else `:natural` |
+| `:natural`  | identity column ordering (opt-in; usually ~2× slower than `:amd` on dense-fill matrices) |
+| `:amd`      | AMD on `AᵀA` via the `AMD.jl` weak dep (`using AMD` to enable)        |
+| `:colamd`   | currently an alias for `:amd`                                        |
+| `:adaptive` | build both `:amd` and `:natural` symbolics, keep the shallower-etree one (~30 µs overhead) |
+
+`:default` is the recommended choice: it gives CXSparse-class
+performance out of the box whenever `using AMD` has been executed in the
+session (directly or via a transitive dep), and falls back to `:natural`
+without warning otherwise. Use `ordering = :natural` to opt out
+explicitly for matrices that are already well-ordered (block diagonal,
+banded, etc.).
+
+```julia
+F1 = csr_qr(A)                          # = :default (= :amd if AMD loaded)
+F2 = csr_qr(A; ordering = :natural)     # opt-in to the chain etree
+F3 = csr_qr(A; ordering = :amd)         # explicit :amd; errors if AMD.jl not loaded
+F4 = csr_qr(A; ordering = :adaptive)    # build both, keep the shallower etree
+```
+
+## Approximate factorization
+
+`csr_qr` accepts a `drop_tol::Real` keyword (default `0`). When
+`drop_tol > 0`, entries of each Householder vector `V[:, k]` with
+`|v_i| <= drop_tol * ‖v‖` are discarded after the reflector is built;
+`β_k` is rescaled for the truncated vector so `H̃ = I - β̃ ṽ ṽᵀ` remains
+a proper Householder. The result is an approximate QR — the residual
+`‖A x - b‖` grows with `drop_tol` — but the apply step walks fewer
+entries on every subsequent call. Useful when you can tolerate a larger
+residual to shrink the factorized form.
+
+```julia
+F_exact = csr_qr(A)                    # drop_tol = 0
+F_approx = csr_qr(A; drop_tol = 1e-8)  # smaller V, larger ‖A x - b‖
 ```
 
 ## Rank-deficient inputs
