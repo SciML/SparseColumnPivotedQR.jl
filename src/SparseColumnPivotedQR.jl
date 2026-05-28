@@ -24,10 +24,6 @@ end
 # transparently ignore `adaptive_dense` and run the pure-Julia sparse kernel.
 @inline _is_blas_eltype(::Type{T}) where {T} = T <: LinearAlgebra.BlasFloat
 
-# One-time warning so a non-BLAS caller passing `adaptive_dense=true` learns
-# the option was ignored, without spamming on every refactor.
-const _ADAPTIVE_DENSE_WARNED = Ref(false)
-
 # Grow a (rowval, nzval) pair so that both have at least `needed` capacity.
 # Used by the numeric kernel to expand V/R output buffers if the symbolic
 # bound was undershot.
@@ -1097,16 +1093,9 @@ function _csc_qr_numeric!(
     drop_active = drop_tol > zero(RT)
     drop_tol2 = drop_tol * drop_tol
     # The dense fallback relies on LAPACK geqp3!/ormqr!, which exist only for
-    # BLAS float types. For generic T, disable adaptive_dense and run the
-    # sparse kernel to completion. Warn once so the ignored option is visible.
+    # BLAS float types. For generic T (e.g. BigFloat, ForwardDiff.Dual) just run
+    # the pure-Julia sparse kernel to completion.
     if adaptive_dense && !_is_blas_eltype(T)
-        if !_ADAPTIVE_DENSE_WARNED[]
-            _ADAPTIVE_DENSE_WARNED[] = true
-            @warn "adaptive_dense=true is only supported for BLAS float types " *
-                "(Float32/Float64/ComplexF32/ComplexF64); falling back to the " *
-                "pure-Julia sparse kernel for eltype $T." maxlog = 1
-        end
-        @debug "adaptive_dense ignored for non-BLAS eltype $T; using sparse kernel."
         adaptive_dense = false
     end
     m, n, m2 = sym.m, sym.n, sym.m2
