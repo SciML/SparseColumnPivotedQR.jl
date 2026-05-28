@@ -146,6 +146,24 @@ mutable struct CSRQRFactorization{T, RT}
     rnk::Int
     tol::RT
     sym::CSRQRSymbolic
+    # Adaptive dense fallback. When the active submatrix becomes dense enough
+    # mid-factorization we switch to LAPACK geqp3 on the trailing block. The
+    # fields below describe that block; they are zero-length / `k_dense == 0`
+    # when no transition occurred.
+    #
+    # `k_dense`     : sparse Householders are V[:, 1..k_dense]; dense tail
+    #                 covers columns k_dense+1..n.
+    # `D`           : (m2 - k_dense) x (n - k_dense) compact LAPACK form from
+    #                 geqp3 — strict lower triangle = Householder vectors v,
+    #                 upper triangle = R (also redundantly emitted into CSC R).
+    # `dtau`        : Householder coefficients τ for the dense tail.
+    # `q_eff`       : composed column permutation (length n). Equals sym.q
+    #                 when k_dense == 0; otherwise equals
+    #                 [sym.q[1..k_dense]; sym.q[k_dense .+ jpvt_dense]].
+    k_dense::Int
+    D::Matrix{T}
+    dtau::Vector{T}
+    q_eff::Vector{Int}
 end
 
 LinearAlgebra.rank(F::CSRQRFactorization) = F.rnk
@@ -614,7 +632,8 @@ function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol = :default) where 
 end
 
 """
-    csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing, drop_tol=0) -> CSRQRFactorization
+    csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing, drop_tol=0,
+               adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
 
 Numeric factorization given a `CSRQRSymbolic`. Implements the Davis
 `cs_qr` algorithm (scatter–apply–emit on a dense workspace) with the V/R
@@ -633,17 +652,30 @@ the resulting factorization is an *approximate* QR (residual `‖A x - b‖`
 grows with `drop_tol`) but subsequent `apply_QH` / `apply_Q` over fewer
 nonzeros becomes cheaper. Typical safe values are `1e-12` to `1e-8` —
 larger values trade accuracy for fill.
+
+If `adaptive_dense=true`, the numeric kernel monitors the density of the
+just-emitted Householder columns. Once the active submatrix exceeds
+`dense_threshold * (m2 - k + 1)` density (default 40%) over several
+consecutive columns, it materializes the trailing block as a dense matrix
+and finishes with LAPACK `geqp3!`. The composed column permutation is
+stored in `F.q_eff`.
 """
 function csr_factor(
         A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
         tol::Union{Nothing, Real} = nothing,
-        drop_tol::Real = 0
+        drop_tol::Real = 0,
+        adaptive_dense::Bool = false,
+        dense_threshold::Real = 0.4
     ) where {Bi, T}
-    return _factor_kernel(A, sym, tol, nothing, real(T)(drop_tol))
+    return _factor_kernel(
+        A, sym, tol, nothing, real(T)(drop_tol),
+        adaptive_dense, real(T)(dense_threshold)
+    )
 end
 
 """
-    csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:default, drop_tol=0) -> CSRQRFactorization
+    csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:default, drop_tol=0,
+           adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
 
 One-shot convenience: equivalent to `csr_factor(A, csr_analyze(A; ordering); tol)`.
 
@@ -657,23 +689,31 @@ function csr_qr(
         A::SparseMatrixCSR{Bi, T};
         tol::Union{Nothing, Real} = nothing,
         ordering::Symbol = :default,
-        drop_tol::Real = 0
+        drop_tol::Real = 0,
+        adaptive_dense::Bool = false,
+        dense_threshold::Real = 0.4
     ) where {Bi, T}
     sym = csr_analyze(A; ordering = ordering)
-    return csr_factor(A, sym; tol = tol, drop_tol = drop_tol)
+    return csr_factor(
+        A, sym; tol = tol, drop_tol = drop_tol,
+        adaptive_dense = adaptive_dense, dense_threshold = dense_threshold
+    )
 end
 
 """
-    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing, drop_tol=0) -> CSRQRFactorization
+    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing, drop_tol=0,
+                  adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
 
 Numeric refactorization, mutating `F` in place. If the sparsity pattern of
 `A` matches the one captured in `F.sym`, the symbolic is reused (skipping
 the etree / `pinv` / `leftmost` work) and the pre-allocated numeric
-workspace on the symbolic is reused — steady-state calls allocate nothing.
+workspace on the symbolic is reused — steady-state calls allocate nothing
+(unless `adaptive_dense=true` triggers, which allocates the dense block).
 Otherwise a fresh analyze is performed (and a new workspace lazily built)
 before refactoring.
 
-The `drop_tol` keyword has the same meaning as in [`csr_factor`](@ref).
+The `drop_tol`, `adaptive_dense`, and `dense_threshold` keywords have the
+same meaning as in [`csr_factor`](@ref).
 
 `F`'s `V_*`, `R_*`, `beta` buffers are overwritten with the new values
 (growing only if the previous bounds were undersized). The return value is
@@ -683,14 +723,17 @@ function csr_refactor!(
         F::CSRQRFactorization{T},
         A::SparseMatrixCSR{Bi};
         tol::Union{Nothing, Real} = nothing,
-        drop_tol::Real = 0
+        drop_tol::Real = 0,
+        adaptive_dense::Bool = false,
+        dense_threshold::Real = 0.4
     ) where {T, Bi}
     dt = real(T)(drop_tol)
+    dth = real(T)(dense_threshold)
     if _pattern_matches(F.sym, A)
-        return _factor_kernel(A, F.sym, tol, F, dt)
+        return _factor_kernel(A, F.sym, tol, F, dt, adaptive_dense, dth)
     else
         sym = csr_analyze(A; ordering = F.sym.ordering)
-        return _factor_kernel(A, sym, tol, F, dt)
+        return _factor_kernel(A, sym, tol, F, dt, adaptive_dense, dth)
     end
 end
 
@@ -726,7 +769,9 @@ function _factor_kernel(
         A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
         tol::Union{Nothing, Real},
         F::Union{Nothing, CSRQRFactorization},
-        drop_tol::Real = zero(real(T))
+        drop_tol::Real = zero(real(T)),
+        adaptive_dense::Bool = false,
+        dense_threshold::Real = real(T)(0.4)
     ) where {Bi, T}
     m, n = size(A)
     (m == sym.m && n == sym.n) ||
@@ -752,7 +797,10 @@ function _factor_kernel(
     # Apply row+column permutation S = (P A Q) into workspace buffers.
     _permute_pq!(ws, sym_use.pinv, sym_use.q, m, n)
 
-    return _csc_qr_numeric!(ws, sym_use, tol_use, tol2, F, RT(drop_tol))
+    return _csc_qr_numeric!(
+        ws, sym_use, tol_use, tol2, F, RT(drop_tol),
+        adaptive_dense, RT(dense_threshold)
+    )
 end
 
 # In-place CSR -> CSC of A, plus per-column squared norms and ||A||_F^2.
@@ -1030,7 +1078,9 @@ function _csc_qr_numeric!(
         ws::_CSRQRWorkspace{T, RT}, sym::CSRQRSymbolic,
         tol_use::RT, tol2::RT,
         F::Union{Nothing, CSRQRFactorization},
-        drop_tol::RT = zero(RT)
+        drop_tol::RT = zero(RT),
+        adaptive_dense::Bool = false,
+        dense_threshold::RT = RT(0.4)
     ) where {T, RT}
     drop_active = drop_tol > zero(RT)
     drop_tol2 = drop_tol * drop_tol
@@ -1106,6 +1156,20 @@ function _csc_qr_numeric!(
     rnz_total = 0
     vnz_total = 0
     rnk = 0
+
+    # Adaptive-dense state. `k_sparse_done == 0` means we never transitioned.
+    # When we decide to switch, we break out of the sparse loop with
+    # `k_sparse_done > 0` and run the dense fallback below.
+    k_sparse_done = 0    # number of sparse columns successfully completed
+    consec_dense = 0     # consecutive columns whose V has crossed threshold
+    # Minimum number of remaining columns to justify the dense overhead.
+    # Below this we just finish sparse — at small block sizes geqp3 setup
+    # cost dwarfs any saving.
+    dense_min_remaining = 16
+    # Require at least this many consecutive dense V columns before we
+    # actually switch. This guards against isolated density spikes in an
+    # otherwise-sparse matrix.
+    dense_consec_required = 4
 
     # Generation-shifted stamp for the `w` marker. Each numeric call starts
     # a fresh generation (wbase + 1 .. wbase + n). After the call, all stamps
@@ -1307,18 +1371,241 @@ function _csc_qr_numeric!(
         for q in 1:vlen
             x[vrows[q]] = zero(T)
         end
+
+        # --- Adaptive dense fallback trigger -----------------------------
+        # If the just-emitted V[:,k] is dense relative to the (m2 - k + 1)
+        # active rows AND we've had `dense_consec_required` consecutive
+        # dense columns AND there are enough remaining columns to justify
+        # the dense overhead, break and finish in dense.
+        #
+        # The consecutive-dense guard stops the fallback from firing on
+        # AMD-ordered inputs where the etree keeps individual V columns
+        # sparse on average even when one isolated column is dense.
+        if adaptive_dense && k < n
+            active_rows = m2 - k
+            if active_rows > 0
+                density = vlen / RT(m2 - k + 1)
+                if density > dense_threshold
+                    consec_dense += 1
+                else
+                    consec_dense = 0
+                end
+                if (n - k) >= dense_min_remaining &&
+                        consec_dense >= dense_consec_required
+                    k_sparse_done = k
+                    break
+                end
+            end
+        end
     end
 
-    # Trim V/R to actual sizes. (resize! to a smaller value is O(1) on Vectors.)
+    if k_sparse_done == 0
+        # No dense transition. Trim V/R and return pure-sparse.
+        resize!(Vi, vnz_total); resize!(Vx, vnz_total)
+        resize!(Ri, rnz_total); resize!(Rx, rnz_total)
+        if F === nothing
+            return CSRQRFactorization{T, RT}(
+                sym.m, sym.n,
+                Vp, Vi, Vx,
+                Rp, Ri, Rx,
+                beta, rnk, tol_use, sym,
+                0, Matrix{T}(undef, 0, 0), T[], sym.q
+            )
+        else
+            # Mutate F in place. In the steady-state refactor! case (no dense
+            # transition, F previously also had no dense tail) we deliberately
+            # avoid allocating fresh D/dtau/q_eff: reuse the existing empty
+            # arrays and re-point q_eff at sym.q (no copy). This keeps the
+            # @allocated refactor! exactly zero. We only reset D/dtau if the
+            # previous call HAD transitioned to dense.
+            F.m = sym.m; F.n = sym.n
+            F.V_colptr = Vp; F.V_rowval = Vi; F.V_nzval = Vx
+            F.R_colptr = Rp; F.R_rowval = Ri; F.R_nzval = Rx
+            F.beta = beta
+            F.rnk = rnk
+            F.tol = tol_use
+            F.sym = sym
+            if F.k_dense != 0
+                F.k_dense = 0
+                F.D = Matrix{T}(undef, 0, 0)
+                F.dtau = T[]
+            end
+            F.q_eff = sym.q
+            return F
+        end
+    end
+
+    # ----------------------------------------------------------------------
+    # Dense fallback. We have V[:,1..k_sparse_done] and R[1..k_sparse_done, :]
+    # for cols 1..k_sparse_done. For each remaining column j in
+    # (k_sparse_done+1)..n we:
+    #   * scatter S[:, j] into x
+    #   * apply H_1..H_{k_sparse_done} (sparse) — also picks up R top rows
+    #   * emit R[1..k_sparse_done, j] into a per-column staging buffer
+    #     (we don't yet know the dense jpvt permutation, so we cannot write
+    #     into the final CSC R until after geqp3)
+    #   * place the active part x[k_sparse_done+1..m2] into a column of D
+    # ----------------------------------------------------------------------
+    ks = k_sparse_done
+    n_active = n - ks
+    m_active = m2 - ks
+    # Dense block: column j corresponds to original column ks + j of S.
+    D = Matrix{T}(undef, m_active, n_active)
+    # Top R staging: top_R[i, j] = R[i, ks + j]. Stored densely; most of it
+    # is zero, but at the densities that trigger this fallback the top rows
+    # are nearly fully populated anyway.
+    top_R = zeros(T, ks, n_active)
+
+    @inbounds for jj in 1:n_active
+        kcol = ks + jj
+        kstamp = wbase + kcol
+        top = n + 1
+        c1 = colptr[kcol]; c2 = colptr[kcol + 1] - 1
+        # 1) scatter S[:, kcol] into x and compute the ereach for prior H's.
+        for p in c1:c2
+            i = rowval[p]
+            x[i] = nzval[p]
+            lm = leftmost[i]
+            if lm > 0 && lm <= ks
+                len = 0
+                jjj = lm
+                while jjj != 0 && w[jjj] != kstamp && jjj <= ks
+                    s[len + 1] = jjj
+                    len += 1
+                    w[jjj] = kstamp
+                    jjj = parent[jjj]
+                end
+                while len > 0
+                    top -= 1
+                    s[top] = s[len]
+                    len -= 1
+                end
+            end
+        end
+
+        # 2) Apply sparse H_1..H_{ks}: walk s[top..n] in increasing column
+        # order; for each prior column p_idx <= ks we apply that H to x and
+        # then emit x[p_idx] into top_R.
+        for spos in top:n
+            p_idx = s[spos]
+            p_idx > ks && continue
+            vc1 = Vp[p_idx]; vc2 = Vp[p_idx + 1] - 1
+            bk = beta[p_idx]
+            tau = zero(T)
+            @simd for vp in vc1:vc2
+                tau += conj(Vx[vp]) * x[Vi[vp]]
+            end
+            if bk != 0 && tau != 0
+                tau_b = T(bk) * tau
+                @simd for vp in vc1:vc2
+                    x[Vi[vp]] -= tau_b * Vx[vp]
+                end
+            end
+            # Emit into top_R[p_idx, jj]; clear x[p_idx].
+            top_R[p_idx, jj] = x[p_idx]
+            x[p_idx] = zero(T)
+        end
+
+        # 3) Place active rows x[ks+1..m2] into D[:, jj]. The active vector
+        # may have unmarked rows that are nonzero only if leftmost[i] <= ks
+        # for that i. We must copy ALL rows ks+1..m2 from x — we have no
+        # cheap pattern tracking here. Also clear x as we go.
+        for i in 1:m_active
+            xi = x[ks + i]
+            D[i, jj] = xi
+            x[ks + i] = zero(T)
+        end
+    end
+
+    # 4) Run LAPACK column-pivoted QR on D. Result:
+    #    - Upper triangle of D[1:n_active, 1:n_active] = R_dense
+    #    - Strict lower triangle = Householder v's
+    #    - dtau = Householder coefficients
+    #    - jpvt = column permutation of the dense block (1-based)
+    jpvt = zeros(LinearAlgebra.BlasInt, n_active)
+    dtau = Vector{T}(undef, min(m_active, n_active))
+    LinearAlgebra.LAPACK.geqp3!(D, jpvt, dtau)
+
+    # 5) Compose q_eff = [sym.q[1..ks]; sym.q[ks .+ jpvt]].
+    q_eff = Vector{Int}(undef, n)
+    @inbounds for k in 1:ks
+        q_eff[k] = sym.q[k]
+    end
+    @inbounds for j in 1:n_active
+        q_eff[ks + j] = sym.q[ks + Int(jpvt[j])]
+    end
+
+    # 6) Emit R columns for the dense tail into CSC R.
+    # For final column ks + j (post-jpvt), top rows come from
+    # top_R[:, jpvt[j]] and bottom rows from upper triangle of D.
+    @inbounds for j in 1:n_active
+        kcol = ks + j
+        src_col = Int(jpvt[j])
+        # Top rows (1..ks): copy from top_R[:, src_col], skip exact zeros.
+        for i in 1:ks
+            v = top_R[i, src_col]
+            if v != zero(T)
+                rnz_total += 1
+                if rnz_total > length(Ri)
+                    _grow_pair!(Ri, Rx, rnz_total)
+                end
+                Ri[rnz_total] = i
+                Rx[rnz_total] = v
+            end
+        end
+        # Bottom (rows ks+1..ks+j) from upper triangle of D.
+        for i in 1:j
+            v = D[i, j]
+            if v != zero(T) || i == j  # always emit diagonal for shape
+                rnz_total += 1
+                if rnz_total > length(Ri)
+                    _grow_pair!(Ri, Rx, rnz_total)
+                end
+                Ri[rnz_total] = ks + i
+                Rx[rnz_total] = v
+            end
+        end
+        Rp[kcol + 1] = rnz_total + 1
+        # No sparse V column for the dense tail.
+        Vp[kcol + 1] = vnz_total + 1
+        beta[kcol] = zero(RT)
+    end
+
+    # 7) Determine dense block's rank-revealing rank using consistent tol.
+    @inbounds for j in 1:n_active
+        d = abs(D[j, j])
+        if d > tol_use
+            rnk += 1
+        end
+    end
+
+    # Trim V/R to actual sizes.
     resize!(Vi, vnz_total); resize!(Vx, vnz_total)
     resize!(Ri, rnz_total); resize!(Rx, rnz_total)
 
+    return _finish_factorization!(
+        F, sym, Vp, Vi, Vx, Rp, Ri, Rx, beta, rnk, tol_use,
+        ks, D, dtau, q_eff
+    )
+end
+
+# Construct a fresh `CSRQRFactorization` or refresh the fields of the
+# provided `F` in place. Shared between the pure-sparse and dense-fallback
+# return paths so the dense-tail fields stay in sync with the buffers.
+function _finish_factorization!(
+        F::Union{Nothing, CSRQRFactorization}, sym::CSRQRSymbolic,
+        Vp, Vi::Vector{Int}, Vx::Vector{T},
+        Rp, Ri::Vector{Int}, Rx::Vector{T},
+        beta::Vector{RT}, rnk::Int, tol_use::RT,
+        k_dense::Int, D::Matrix{T}, dtau::Vector{T}, q_eff::Vector{Int}
+    ) where {T, RT}
     if F === nothing
         return CSRQRFactorization{T, RT}(
             sym.m, sym.n,
             Vp, Vi, Vx,
             Rp, Ri, Rx,
-            beta, rnk, tol_use, sym
+            beta, rnk, tol_use, sym,
+            k_dense, D, dtau, q_eff
         )
     else
         # Mutate F in place, refresh fields.
@@ -1329,6 +1616,10 @@ function _csc_qr_numeric!(
         F.rnk = rnk
         F.tol = tol_use
         F.sym = sym
+        F.k_dense = k_dense
+        F.D = D
+        F.dtau = dtau
+        F.q_eff = q_eff
         return F
     end
 end
@@ -1347,7 +1638,11 @@ end
 function _apply_QH!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
     Vp = F.V_colptr; Vi = F.V_rowval; Vx = F.V_nzval; beta = F.beta
     n = F.n
-    @inbounds for k in 1:n
+    # When an adaptive-dense fallback transitioned at column k_dense, only the
+    # first k_dense Householders live in V. The remaining ones live in F.D.
+    ks = F.k_dense
+    n_sparse = ks == 0 ? n : ks
+    @inbounds for k in 1:n_sparse
         bk = beta[k]
         bk == 0 && continue
         vc1 = Vp[k]; vc2 = Vp[k + 1] - 1
@@ -1364,13 +1659,34 @@ function _apply_QH!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
             work[Vi[vp]] -= tau_b * Vx[vp]
         end
     end
+    if ks > 0
+        # Apply dense Householders to work[ks+1 .. ks+m_active] via LAPACK.
+        # The dense block is stored in F.D (m_active x n_active), tau in F.dtau.
+        # work has length m2; the dense block was built on rows ks+1..m2 of x.
+        m_active = size(F.D, 1)
+        if m_active > 0 && !isempty(F.dtau)
+            sub = @view work[(ks + 1):(ks + m_active)]
+            trans = T <: Complex ? 'C' : 'T'
+            LinearAlgebra.LAPACK.ormqr!('L', trans, F.D, F.dtau, sub)
+        end
+    end
     return work
 end
 
 function _apply_Q!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
     Vp = F.V_colptr; Vi = F.V_rowval; Vx = F.V_nzval; beta = F.beta
     n = F.n
-    @inbounds for k in n:-1:1
+    ks = F.k_dense
+    # If we transitioned to dense, first apply dense H's (in reverse via 'N').
+    if ks > 0
+        m_active = size(F.D, 1)
+        if m_active > 0 && !isempty(F.dtau)
+            sub = @view work[(ks + 1):(ks + m_active)]
+            LinearAlgebra.LAPACK.ormqr!('L', 'N', F.D, F.dtau, sub)
+        end
+    end
+    n_sparse = ks == 0 ? n : ks
+    @inbounds for k in n_sparse:-1:1
         bk = beta[k]
         bk == 0 && continue
         vc1 = Vp[k]; vc2 = Vp[k + 1] - 1
@@ -1456,7 +1772,9 @@ function LinearAlgebra.ldiv!(
     length(x) == F.n || throw(DimensionMismatch("x length $(length(x)) != n=$(F.n)"))
     m, n, m2 = F.m, F.n, F.sym.m2
     pinv = F.sym.pinv
-    q = F.sym.q
+    # Use the composed permutation: equals sym.q when no dense transition,
+    # otherwise carries the dense block's geqp3 column pivoting.
+    q = F.q_eff
 
     # Workspace sized to m2 (handles fictitious rows).
     work = zeros(T, m2)

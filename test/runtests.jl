@@ -550,4 +550,141 @@ end
         @test norm(A * x - b) ≈ norm(A * xs - b) atol = 1.0e-8
     end
 
+    @testset "Adaptive dense fallback: square full-rank dense" begin
+        # Densely populated matrix; threshold should trigger the dense fallback
+        # for almost every column.
+        Random.seed!(17)
+        n = 40
+        Adense = randn(n, n) + 4 * I
+        Acsr = build_csr(Adense)
+        b = randn(n)
+        F = csr_qr(Acsr; adaptive_dense = true, dense_threshold = 0.2)
+        @test F.k_dense > 0
+        @test F.k_dense < n
+        @test rank(F) == n
+        x = F \ b
+        xref = Adense \ b
+        @test norm(Adense * x - b) / norm(b) < 1.0e-10
+        @test norm(x - xref) / max(norm(xref), 1.0) < 1.0e-10
+    end
+
+    @testset "Adaptive dense fallback: tall LS" begin
+        Random.seed!(18)
+        m, n = 40, 22
+        Adense = randn(m, n)
+        Acsr = build_csr(Adense)
+        b = randn(m)
+        F = csr_qr(Acsr; adaptive_dense = true, dense_threshold = 0.2)
+        # Dense tall LS: with this size the fallback should kick in.
+        @test F.k_dense > 0
+        @test rank(F) == n
+        x = F \ b
+        xref = Adense \ b
+        @test norm(x - xref) / max(norm(xref), 1.0) < 1.0e-10
+    end
+
+    @testset "Adaptive dense fallback: rank-deficient block" begin
+        # Rank-deficient where rank deficiency is in the dense tail.
+        Random.seed!(19)
+        n = 20
+        U = randn(n, n - 2); V = randn(n, n - 2)
+        Adense = U * V'   # n x n with rank n - 2
+        Acsr = build_csr(Adense)
+        b = Adense * randn(n)  # in range
+        F = csr_qr(Acsr; tol = 1.0e-10, adaptive_dense = true, dense_threshold = 0.2)
+        @test F.k_dense > 0
+        @test rank(F) <= n - 2
+        x = F \ b
+        @test all(isfinite, x)
+        # residual should be near zero
+        @test norm(Adense * x - b) / max(norm(b), 1.0) < 1.0e-8
+    end
+
+    @testset "Adaptive dense fallback: sparse never triggers" begin
+        # Truly sparse matrix — fallback should stay off or trigger only very
+        # late (after most of the work is done).
+        Random.seed!(20)
+        n = 80
+        A = sprand(Float64, n, n, 0.04) + 5 * sparse(I, n, n)
+        Acsr = build_csr(Matrix(A))
+        b = randn(n)
+        F = csr_qr(Acsr; adaptive_dense = true, dense_threshold = 0.4)
+        x = F \ b
+        @test norm(A * x - b) / norm(b) < 1.0e-10
+        # Compare to non-adaptive path
+        F_nat = csr_qr(Acsr; adaptive_dense = false)
+        x_nat = F_nat \ b
+        @test norm(x - x_nat) / max(norm(x_nat), 1.0) < 1.0e-10
+    end
+
+    @testset "Adaptive dense fallback: ComplexF64" begin
+        Random.seed!(21)
+        n = 25
+        Adense = randn(ComplexF64, n, n) + 5 * I
+        Acsr = build_csr(Adense)
+        b = randn(ComplexF64, n)
+        F = csr_qr(Acsr; adaptive_dense = true, dense_threshold = 0.2)
+        @test F.k_dense > 0
+        @test rank(F) == n
+        x = F \ b
+        @test norm(Adense * x - b) / norm(b) < 1.0e-10
+    end
+
+    @testset "Adaptive dense fallback: refactor!" begin
+        # Pattern matches and we re-use symbolic. adaptive_dense flows
+        # through refactor! independently of the original factor's setting.
+        Random.seed!(22)
+        n = 30
+        Asp = sprand(Float64, n, n, 0.5)
+        rows, cols, _ = findnz(Asp)
+        v1 = randn(length(rows)); v2 = randn(length(rows))
+        A1 = sparse(rows, cols, v1, n, n) + 4 * sparse(I, n, n)
+        A2 = sparse(rows, cols, v2, n, n) + 4 * sparse(I, n, n)
+        Acsr1 = build_csr(Matrix(A1))
+        Acsr2 = build_csr(Matrix(A2))
+        b = randn(n)
+
+        F1 = csr_qr(Acsr1; adaptive_dense = true, dense_threshold = 0.2)
+        x1 = F1 \ b
+        @test norm(A1 * x1 - b) / norm(b) < 1.0e-10
+
+        F2 = csr_refactor!(F1, Acsr2; adaptive_dense = true, dense_threshold = 0.2)
+        x2 = F2 \ b
+        @test norm(A2 * x2 - b) / norm(b) < 1.0e-10
+
+        # Compare against fresh factor.
+        F2_fresh = csr_qr(Acsr2; adaptive_dense = true, dense_threshold = 0.2)
+        x2_fresh = F2_fresh \ b
+        @test norm(x2 - x2_fresh) / max(norm(x2_fresh), 1.0) < 1.0e-10
+    end
+
+    @testset "Adaptive dense fallback: matches non-adaptive on user matrices" begin
+        # On the actual user matrices, both adaptive and non-adaptive paths
+        # should produce solutions whose residuals match SPQR's.
+        dir = "/home/crackauc/.claude/uploads/d279ff12-71e6-4faf-b1ac-6715899a256b"
+        if isdir(dir)
+            files = sort(readdir(dir; join = true))
+            for f in files
+                text = read(f, String)
+                lines = split(text, '\n'; keepempty = false)
+                A = eval(Meta.parse(strip(lines[1])))
+                b = eval(Meta.parse(strip(lines[2])))
+                Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+                F = csr_qr(Acsr; adaptive_dense = true)
+                Fspqr = qr(A)
+                xspqr = Fspqr \ b
+                x = F \ b
+                if all(isfinite, b)
+                    @test all(isfinite, x)
+                    rmy = norm(A * x - b)
+                    rspqr = norm(A * xspqr - b)
+                    scale = max(rspqr, 1.0e-12 * norm(b))
+                    @test rmy <= 1.0e-8 + 2 * scale
+                end
+            end
+        else
+            @info "User matrix directory not available; skipping."
+        end
+    end
+
 end
