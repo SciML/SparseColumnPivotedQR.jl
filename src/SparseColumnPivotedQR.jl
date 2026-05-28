@@ -1667,6 +1667,113 @@ function _finish_factorization!(
     end
 end
 
+# Build the row-major transpose of panel `pidx`'s V columns into a dense
+# row-major block (LAPACK xlarfb shape). Instead of L scattered gathers/scatters
+# over `x` (one per Householder column), the WY apply walks each touched row of
+# the panel once: it gathers `x[row]` a single time and accumulates all L dot
+# products of Vᵀx simultaneously, then applies the rank-L update in one second
+# pass. The per-row block is stored densely (length L, padded with zeros for the
+# columns that don't touch the row) so both inner loops are contiguous and
+# vectorizable, with no index indirection — the column-major sparse apply lost
+# SIMD on its scattered accumulation, which is what made it a regression.
+#
+# Storage is a flat per-panel store:
+#   rm_rowstart[pidx]..rm_rowstart[pidx + 1] - 1  -> flat row slots for the panel
+#   rm_rows[r]                                     -> global (permuted) row index
+#   rm_denseoff[pidx]                              -> start of panel's dense block
+#     row r's L values live at rm_dense[rm_denseoff[pidx] + (r - rstart - 1)*L ..]
+#
+# `row_pos` is a dense scratch of size m2, zero on entry and restored to zero on
+# exit; it maps a global row to its 0-based row offset within the panel.
+@inline function _build_row_major_panel!(
+        pidx::Int, bs::Int, n::Int,
+        Vp::Vector{Int}, Vi::Vector{Int}, Vx::Vector{T},
+        rm_rowstart::Vector{Int}, rm_rows::Vector{Int},
+        rm_denseoff::Vector{Int}, rm_dense::Vector{T},
+        rm_rowcount::Base.RefValue{Int}, rm_densecount::Base.RefValue{Int},
+        row_pos::Vector{Int}
+    ) where {T}
+    panel_start = (pidx - 1) * bs + 1
+    panel_end = min(pidx * bs, n)
+    L = panel_end - panel_start + 1
+    rstart = rm_rowcount[]
+    dbase = rm_densecount[]
+    rm_rowstart[pidx] = rstart + 1
+    rm_denseoff[pidx] = dbase
+
+    # Pass 1: discover distinct rows, assign each a 0-based panel row offset.
+    nrows = 0
+    @inbounds for j in 1:L
+        col = panel_start + j - 1
+        for vp in Vp[col]:(Vp[col + 1] - 1)
+            i = Vi[vp]
+            if row_pos[i] == 0
+                rm_rows[rstart + nrows + 1] = i
+                row_pos[i] = nrows + 1
+                nrows += 1
+            end
+        end
+    end
+
+    # Zero the dense block (so absent (row, col) entries contribute 0), then
+    # scatter each V value into its (row offset, local column) dense slot.
+    nslots = nrows * L
+    @inbounds for t in 1:nslots
+        rm_dense[dbase + t] = zero(T)
+    end
+    @inbounds for j in 1:L
+        col = panel_start + j - 1
+        for vp in Vp[col]:(Vp[col + 1] - 1)
+            i = Vi[vp]
+            ri = row_pos[i] - 1
+            rm_dense[dbase + ri * L + j] = Vx[vp]
+        end
+    end
+
+    # Clear row_pos.
+    @inbounds for r in (rstart + 1):(rstart + nrows)
+        row_pos[rm_rows[r]] = 0
+    end
+
+    rm_rowcount[] = rstart + nrows
+    rm_densecount[] = dbase + nslots
+    rm_rowstart[pidx + 1] = rstart + nrows + 1
+    return nothing
+end
+
+# Finalize panel `pidx`: build its packed T and its dense row-major transpose,
+# growing the row-major store if the symbolic nnz(V) bound undershot. The panel
+# touches at most `pnnz` distinct rows, each holding `L ≤ bs` dense values.
+@inline function _finalize_panel_wy!(
+        T_flat::Array{T, 3},
+        pidx::Int, bs::Int, n::Int,
+        Vp::Vector{Int}, Vi::Vector{Int}, Vx::Vector{T}, beta::Vector{RT},
+        xt::Vector{T},
+        rm_rowstart::Vector{Int}, rm_rows::Vector{Int},
+        rm_denseoff::Vector{Int}, rm_dense::Vector{T},
+        rm_rowcount::Base.RefValue{Int}, rm_densecount::Base.RefValue{Int},
+        row_pos::Vector{Int}
+    ) where {T, RT}
+    _build_T_panel!(T_flat, pidx, bs, n, Vp, Vi, Vx, beta, xt)
+    panel_start = (pidx - 1) * bs + 1
+    panel_end = min(pidx * bs, n)
+    pnnz = Vp[panel_end + 1] - Vp[panel_start]
+    L = panel_end - panel_start + 1
+    if rm_rowcount[] + pnnz > length(rm_rows)
+        resize!(rm_rows, max(2 * length(rm_rows), rm_rowcount[] + pnnz))
+    end
+    need_d = rm_densecount[] + pnnz * L
+    if need_d > length(rm_dense)
+        resize!(rm_dense, max(2 * length(rm_dense), need_d))
+    end
+    _build_row_major_panel!(
+        pidx, bs, n, Vp, Vi, Vx,
+        rm_rowstart, rm_rows, rm_denseoff, rm_dense,
+        rm_rowcount, rm_densecount, row_pos
+    )
+    return nothing
+end
+
 # Build the L×L upper-triangular T matrix for the panel of `bs` consecutive
 # Householders ending at column `min(pidx * bs, n)`. Schreiber–van Loan 1989:
 # for H_1, H_2, …, H_L with H_j = I − β_j v_j v_j^*, the product
@@ -1736,15 +1843,18 @@ end
 # Compact-WY blocked numeric kernel. Same scatter / build / emit structure as
 # `_csc_qr_numeric!`, but the ereach pattern in s[top..n] is insertion-sorted
 # into column-index order (the WY identity Q = H_1 H_2 … H_L applies in column
-# order), and after each panel of `bs` consecutive Householders completes its
-# T matrix is built into `T_flat[:, :, pidx]`. The apply walks s[top..n] in
-# column-index order; when entering a complete panel that the ereach hits ≥
-# `WY_BLOCK_MIN_HITS` times, the panel is applied as a block (t = V_p^* x;
-# t = T_p^* t; x -= V_p t) instead of one Householder at a time.
+# order), and after each panel of `bs` consecutive Householders completes both
+# its T matrix (`T_flat[:, :, pidx]`) and its dense row-major transpose (the
+# rm_* store) are built. The apply walks s[top..n] in column-index order; when
+# entering a complete panel that the ereach hits ≥ `WY_BLOCK_MIN_HITS` times,
+# the panel is applied as a block (t = V_p^* x; t = T_p^* t; x -= V_p t). The
+# V_p^* x and V_p t passes run over the row-major transpose so each touched row
+# of `x` is gathered/scattered once for the whole panel with a contiguous inner
+# loop, instead of one scattered gather per Householder column.
 #
 # Uses the pooled workspace buffers (x, s, w, vrows) with the same generation-
 # stamped marker scheme as the unblocked kernel. The WY-specific scratch
-# (T_flat, xt, tvec) is allocated per call — `block_size > 1` is an opt-in
+# (T_flat, xt, tvec, rm_*) is allocated per call — `block_size > 1` is an opt-in
 # path and not required to be zero-allocation.
 function _csc_qr_numeric_wy!(
         ws::_CSRQRWorkspace{T, RT}, sym::CSRQRSymbolic,
@@ -1816,6 +1926,20 @@ function _csc_qr_numeric_wy!(
     xt = zeros(T, m2)
     tvec = Vector{T}(undef, bs)
 
+    # Dense row-major panel store (LAPACK xlarfb shape). Distinct rows ≤ nnz(V);
+    # the dense value block holds up to L per row. Both are grown alongside V if
+    # the symbolic bound undershoots. `row_pos` is a dense per-build row map,
+    # zero on entry/exit.
+    rm_rowcap = max(sym.vnz, 1)
+    rm_densecap = max(sym.vnz * bs, 1)
+    rm_rowstart = Vector{Int}(undef, npanels + 1)
+    rm_rows = Vector{Int}(undef, rm_rowcap)
+    rm_denseoff = Vector{Int}(undef, npanels + 1)
+    rm_dense = Vector{T}(undef, rm_densecap)
+    rm_rowcount = Ref(0)
+    rm_densecount = Ref(0)
+    row_pos = zeros(Int, m2)
+
     Vp[1] = 1
     Rp[1] = 1
     rnz_total = 0
@@ -1882,15 +2006,23 @@ function _csc_qr_numeric_wy!(
                 if hits >= WY_BLOCK_MIN_HITS
                     panel_start = (panel_idx - 1) * bs + 1
                     L = panel_end_full - panel_start + 1
-                    # t = V_panel^* x
+                    rr1 = rm_rowstart[panel_idx]
+                    rr2 = rm_rowstart[panel_idx + 1] - 1
+                    doff = rm_denseoff[panel_idx]
+                    # t = V_panel^* x : one row-major pass over the panel's dense
+                    # transpose. Each touched row gathers x[row] once and feeds
+                    # all L accumulators via a contiguous, vectorizable inner loop
+                    # (LAPACK xlarfb shape, vs L separate scattered gathers).
                     for j in 1:L
-                        pj = panel_start + j - 1
-                        vc1 = Vp[pj]; vc2 = Vp[pj + 1] - 1
-                        tj = zero(T)
-                        @simd for vp in vc1:vc2
-                            tj += conj(Vx[vp]) * x[Vi[vp]]
+                        tvec[j] = zero(T)
+                    end
+                    for r in rr1:rr2
+                        xi = x[rm_rows[r]]
+                        xi == 0 && continue
+                        b = doff + (r - rr1) * L
+                        @simd for j in 1:L
+                            tvec[j] += conj(rm_dense[b + j]) * xi
                         end
-                        tvec[j] = tj
                     end
                     # t = T_p^* t in place.
                     for i in L:-1:1
@@ -1900,15 +2032,14 @@ function _csc_qr_numeric_wy!(
                         end
                         tvec[i] = acc
                     end
-                    # x -= V_panel * t
-                    for j in 1:L
-                        pj = panel_start + j - 1
-                        tj = tvec[j]
-                        tj == 0 && continue
-                        vc1 = Vp[pj]; vc2 = Vp[pj + 1] - 1
-                        @simd for vp in vc1:vc2
-                            x[Vi[vp]] -= tj * Vx[vp]
+                    # x -= V_panel * t : one row-major pass, contiguous inner loop.
+                    for r in rr1:rr2
+                        b = doff + (r - rr1) * L
+                        acc = zero(T)
+                        @simd for j in 1:L
+                            acc += rm_dense[b + j] * tvec[j]
                         end
+                        x[rm_rows[r]] -= acc
                     end
                     # Emit R for ereach entries in this panel; clear x.
                     for sp in spos:(spe - 1)
@@ -1981,9 +2112,11 @@ function _csc_qr_numeric_wy!(
             end
             if k % bs == 0 || k == n
                 panels_built += 1
-                _build_T_panel!(
+                _finalize_panel_wy!(
                     T_flat, panels_built, bs, n,
-                    Vp, Vi, Vx, beta, xt
+                    Vp, Vi, Vx, beta, xt,
+                    rm_rowstart, rm_rows, rm_denseoff, rm_dense,
+                    rm_rowcount, rm_densecount, row_pos
                 )
             end
             continue
@@ -2015,9 +2148,11 @@ function _csc_qr_numeric_wy!(
             end
             if k % bs == 0 || k == n
                 panels_built += 1
-                _build_T_panel!(
+                _finalize_panel_wy!(
                     T_flat, panels_built, bs, n,
-                    Vp, Vi, Vx, beta, xt
+                    Vp, Vi, Vx, beta, xt,
+                    rm_rowstart, rm_rows, rm_denseoff, rm_dense,
+                    rm_rowcount, rm_densecount, row_pos
                 )
             end
             continue
@@ -2055,9 +2190,11 @@ function _csc_qr_numeric_wy!(
 
         if k % bs == 0 || k == n
             panels_built += 1
-            _build_T_panel!(
+            _finalize_panel_wy!(
                 T_flat, panels_built, bs, n,
-                Vp, Vi, Vx, beta, xt
+                Vp, Vi, Vx, beta, xt,
+                rm_rowstart, rm_rows, rm_denseoff, rm_dense,
+                rm_rowcount, rm_densecount, row_pos
             )
         end
     end
