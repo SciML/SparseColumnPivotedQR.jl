@@ -15,8 +15,10 @@ end
 # Builds a CSC SparseMatrixCSC from the (rowptr, colval) CSR pattern and asks
 # AMD.colamd for an unsymmetric column ordering. Falls back to natural if AMD
 # fails for any reason (zero rows, ill-formed pattern, etc).
-function SparseColumnPivotedQR._amd_colperm(rowptr::Vector{Int}, colval::Vector{Int},
-                                            m::Int, n::Int)
+function SparseColumnPivotedQR._amd_colperm(
+        rowptr::Vector{Int}, colval::Vector{Int},
+        m::Int, n::Int
+    )
     # Build a SparseMatrixCSC pattern with dummy values; AMD only needs the pattern.
     # We have the CSR pattern, so convert to CSC.
     nnz_total = length(colval)

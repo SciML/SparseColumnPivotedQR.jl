@@ -3,7 +3,7 @@ module SparseColumnPivotedQR
 using LinearAlgebra
 using SparseArrays
 using SparseMatricesCSR
-using PrecompileTools: @setup_workload, @compile_workload
+using PrecompileTools
 
 import LinearAlgebra: ldiv!, rank
 import Base: \, size, eltype
