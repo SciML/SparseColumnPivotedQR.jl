@@ -24,6 +24,121 @@ end
 # transparently ignore `adaptive_dense` and run the pure-Julia sparse kernel.
 @inline _is_blas_eltype(::Type{T}) where {T} = T <: LinearAlgebra.BlasFloat
 
+# ---------------------------------------------------------------------------
+# Allocation-free LAPACK geqp3 (column-pivoted QR of the dense tail).
+# ---------------------------------------------------------------------------
+#
+# `LinearAlgebra.LAPACK.geqp3!` allocates a fresh `work` buffer (and, for
+# complex types, an `rwork` buffer) plus an `info` cell on every call, and it
+# performs a workspace-size query (`lwork = -1`) call followed by the real
+# call each time. For the real-time `csr_refactor!(adaptive_dense=true)` loop
+# we instead pass in a `work`/`rwork`/`info` triple that lives on the pooled
+# workspace and was sized once via `_geqp3_lwork`. This makes the dense tail's
+# geqp3 call do zero heap work in steady state. The bindings mirror the
+# stdlib `ccall`s exactly (LAPACK BLAS-float types only).
+
+for (geqp3, elty, relty) in (
+        (:dgeqp3_, :Float64, :Float64),
+        (:sgeqp3_, :Float32, :Float32),
+        (:zgeqp3_, :ComplexF64, :Float64),
+        (:cgeqp3_, :ComplexF32, :Float32),
+    )
+    iscmplx = elty in (:ComplexF64, :ComplexF32)
+    @eval begin
+        # Query the optimal `lwork` for an `m x n` geqp3 (one workspace call).
+        function _geqp3_lwork(
+                A::Matrix{$elty}, jpvt::Vector{LinearAlgebra.BlasInt},
+                tau::Vector{$elty}
+            )
+            m, n = size(A)
+            lda = max(1, stride(A, 2))
+            work = Vector{$elty}(undef, 1)
+            lwork = LinearAlgebra.BlasInt(-1)
+            info = Ref{LinearAlgebra.BlasInt}()
+            $(
+                if iscmplx
+                    quote
+                        rwork = Vector{$relty}(undef, max(1, 2n))
+                        ccall(
+                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
+                            Cvoid,
+                            (
+                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
+                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
+                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
+                                Ptr{$relty}, Ptr{LinearAlgebra.BlasInt},
+                            ),
+                            m, n, A, lda, jpvt, tau, work, lwork, rwork, info
+                        )
+                    end
+                else
+                    quote
+                        ccall(
+                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
+                            Cvoid,
+                            (
+                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
+                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
+                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
+                                Ptr{LinearAlgebra.BlasInt},
+                            ),
+                            m, n, A, lda, jpvt, tau, work, lwork, info
+                        )
+                    end
+                end
+            )
+            LinearAlgebra.LAPACK.chklapackerror(info[])
+            return LinearAlgebra.BlasInt(real(work[1]))
+        end
+
+        # geqp3! reusing caller-owned `work`/`rwork`/`info` (no allocation).
+        # `jpvt` must be pre-zeroed (0 = column free to be pivoted). `work`
+        # must be at least the `_geqp3_lwork` size for this `A`.
+        function _geqp3_prealloc!(
+                A::Matrix{$elty}, jpvt::Vector{LinearAlgebra.BlasInt},
+                tau::Vector{$elty}, work::Vector{$elty},
+                rwork::Vector{$relty}, info::Base.RefValue{LinearAlgebra.BlasInt}
+            )
+            m, n = size(A)
+            lda = max(1, stride(A, 2))
+            lwork = LinearAlgebra.BlasInt(length(work))
+            $(
+                if iscmplx
+                    quote
+                        ccall(
+                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
+                            Cvoid,
+                            (
+                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
+                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
+                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
+                                Ptr{$relty}, Ptr{LinearAlgebra.BlasInt},
+                            ),
+                            m, n, A, lda, jpvt, tau, work, lwork, rwork, info
+                        )
+                    end
+                else
+                    quote
+                        ccall(
+                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
+                            Cvoid,
+                            (
+                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
+                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
+                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
+                                Ptr{LinearAlgebra.BlasInt},
+                            ),
+                            m, n, A, lda, jpvt, tau, work, lwork, info
+                        )
+                    end
+                end
+            )
+            LinearAlgebra.LAPACK.chklapackerror(info[])
+            return A, tau, jpvt
+        end
+    end
+end
+
 # Grow a (rowval, nzval) pair so that both have at least `needed` capacity.
 # Used by the numeric kernel to expand V/R output buffers if the symbolic
 # bound was undershot.
@@ -211,6 +326,29 @@ mutable struct _CSRQRWorkspace{T, RT}
     # `solve_xprime` is sized n.
     solve_work::Vector{T}
     solve_xprime::Vector{T}
+    # Pooled scratch for the adaptive-dense fallback so `csr_refactor!` with
+    # `adaptive_dense=true` is allocation-free in steady state. All of these
+    # are sized lazily on the first dense transition (the dense-tail dims are
+    # fixed once the sparsity pattern is). They stay zero-length for matrices
+    # whose factorization never transitions to dense, and for non-BLAS element
+    # types (where the dense path is unavailable, so they are never used).
+    #
+    #   dense_D     : (m2 - ks) x (n - ks) compact LAPACK geqp3 form.
+    #   dense_topR  : ks x (n - ks) staging of the top R rows.
+    #   dense_jpvt  : geqp3 column-pivot output, length (n - ks).
+    #   dense_tau   : geqp3 Householder coeffs, length min(m_active, n_active).
+    #   dense_qeff  : composed column permutation, length n.
+    #   dense_work  : preallocated geqp3 work buffer (lwork queried once).
+    #   dense_rwork : preallocated real work for the complex geqp3 (len 2*n_active).
+    #   dense_info  : geqp3 info return cell (reused, never reallocated).
+    dense_D::Matrix{T}
+    dense_topR::Matrix{T}
+    dense_jpvt::Vector{LinearAlgebra.BlasInt}
+    dense_tau::Vector{T}
+    dense_qeff::Vector{Int}
+    dense_work::Vector{T}
+    dense_rwork::Vector{RT}
+    dense_info::Base.RefValue{LinearAlgebra.BlasInt}
 end
 
 function _alloc_workspace(
@@ -236,6 +374,14 @@ function _alloc_workspace(
         0,
         zeros(T, m2),
         Vector{T}(undef, n),
+        Matrix{T}(undef, 0, 0),
+        Matrix{T}(undef, 0, 0),
+        LinearAlgebra.BlasInt[],
+        T[],
+        Int[],
+        T[],
+        RT[],
+        Ref{LinearAlgebra.BlasInt}(0),
     )
 end
 
@@ -1762,12 +1908,30 @@ function _csc_qr_numeric!(
     ks = k_sparse_done
     n_active = n - ks
     m_active = m2 - ks
-    # Dense block: column j corresponds to original column ks + j of S.
-    D = Matrix{T}(undef, m_active, n_active)
-    # Top R staging: top_R[i, j] = R[i, ks + j]. Stored densely; most of it
-    # is zero, but at the densities that trigger this fallback the top rows
-    # are nearly fully populated anyway.
-    top_R = zeros(T, ks, n_active)
+    # Dense block and top-R staging come from the pooled workspace so a
+    # steady-state `csr_refactor!(adaptive_dense=true)` (fixed pattern => fixed
+    # ks, hence fixed dense-tail dims) does no heap work. The pooled matrices
+    # are reused when their dimensions match and (re)allocated only when the
+    # dense-tail dims change (which, for a fixed pattern, happens at most once).
+    #
+    #   `D`     : column j == original column ks + j of S. Fully overwritten
+    #             below (step 3), so it needs no pre-zeroing.
+    #   `top_R` : top_R[i, j] = R[i, ks + j]. Only ereach-pattern rows are
+    #             written; the rest must read back as zero, so the used
+    #             [1:ks, 1:n_active] block is zeroed before the column loop.
+    dims_changed = false
+    if size(ws.dense_D, 1) != m_active || size(ws.dense_D, 2) != n_active
+        ws.dense_D = Matrix{T}(undef, m_active, n_active)
+        dims_changed = true
+    end
+    if size(ws.dense_topR, 1) != ks || size(ws.dense_topR, 2) != n_active
+        ws.dense_topR = Matrix{T}(undef, ks, n_active)
+    end
+    D = ws.dense_D
+    top_R = ws.dense_topR
+    @inbounds for jj in 1:n_active, i in 1:ks
+        top_R[i, jj] = zero(T)
+    end
 
     @inbounds for jj in 1:n_active
         kcol = ks + jj
@@ -1830,12 +1994,38 @@ function _csc_qr_numeric!(
     #    - Strict lower triangle = Householder v's
     #    - dtau = Householder coefficients
     #    - jpvt = column permutation of the dense block (1-based)
-    jpvt = zeros(LinearAlgebra.BlasInt, n_active)
-    dtau = Vector{T}(undef, min(m_active, n_active))
-    LinearAlgebra.LAPACK.geqp3!(D, jpvt, dtau)
+    # Pooled jpvt / dtau (sized to the fixed dense-tail dims). jpvt must be
+    # zero before geqp3 (0 = column free to be pivoted).
+    ntau = min(m_active, n_active)
+    if length(ws.dense_jpvt) != n_active
+        resize!(ws.dense_jpvt, n_active)
+    end
+    if length(ws.dense_tau) != ntau
+        resize!(ws.dense_tau, ntau)
+    end
+    jpvt = ws.dense_jpvt
+    dtau = ws.dense_tau
+    @inbounds for j in 1:n_active
+        jpvt[j] = zero(LinearAlgebra.BlasInt)
+    end
+    # Pooled geqp3 work buffer: query the optimal lwork once (when unsized or
+    # the dense-tail dims changed) and reuse thereafter, so the geqp3 call
+    # itself allocates nothing in steady state. The query (`lwork = -1`) only
+    # writes the optimal size into `work[1]`; it does not touch `D`/`jpvt`.
+    if isempty(ws.dense_work) || dims_changed
+        lw = _geqp3_lwork(D, jpvt, dtau)
+        resize!(ws.dense_work, max(1, Int(lw)))
+    end
+    if T <: Complex && length(ws.dense_rwork) != max(1, 2 * n_active)
+        resize!(ws.dense_rwork, max(1, 2 * n_active))
+    end
+    _geqp3_prealloc!(D, jpvt, dtau, ws.dense_work, ws.dense_rwork, ws.dense_info)
 
     # 5) Compose q_eff = [sym.q[1..ks]; sym.q[ks .+ jpvt]].
-    q_eff = Vector{Int}(undef, n)
+    if length(ws.dense_qeff) != n
+        resize!(ws.dense_qeff, n)
+    end
+    q_eff = ws.dense_qeff
     @inbounds for k in 1:ks
         q_eff[k] = sym.q[k]
     end
