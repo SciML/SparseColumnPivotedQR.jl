@@ -84,6 +84,17 @@ mutable struct _CSRQRWorkspace{T, RT}
     s::Vector{Int}
     w::Vector{Int}
     vrows::Vector{Int}
+    # Positions (in the current q-order) of columns the numeric kernel flags
+    # rank-deficient. Reused across calls via `empty!` so the full-rank path
+    # does no heap work; consumed by `_factor_kernel`'s deferral re-pass.
+    def_pos::Vector{Int}
+    # Per-original-column membership marker for the deferral fixed-point loop:
+    # `is_indep[j] == 1` iff column j is confirmed leading-independent (a nonzero
+    # pivot in the leading block). Allocated empty and only sized (once) on the
+    # first rank-deficient call, so the full-rank path does no extra heap work.
+    # Cannot alias `w` because the numeric kernel clobbers `w` each pass while
+    # this must persist across passes.
+    is_indep::Vector{Int}
     # Generation counter used as a "stamp base" for the `w` marker array so
     # that the numeric kernel doesn't have to zero `w` between calls. The
     # stamp value used in the kernel is `gen * (n + 1) + k`; an `n`-sized
@@ -114,6 +125,8 @@ function _alloc_workspace(
         Vector{Int}(undef, n),
         zeros(Int, n),
         Vector{Int}(undef, m2),
+        Int[],
+        Int[],
         0,
         zeros(T, m2),
         Vector{T}(undef, n),
@@ -812,10 +825,179 @@ function _factor_kernel(
     # Apply row+column permutation S = (P A Q) into workspace buffers.
     _permute_pq!(ws, sym_use.pinv, sym_use.q, m, n)
 
-    return _csc_qr_numeric!(
+    # Pass 1: factor and collect the positions (in sym_use.q order) of any
+    # columns the kernel flags rank-deficient. `def_pos` is workspace-owned and
+    # reset here, so the common full-rank path does no extra heap work.
+    def_pos = ws.def_pos
+    empty!(def_pos)
+    F1 = _csc_qr_numeric!(
         ws, sym_use, tol_use, tol2, F, RT(drop_tol),
-        adaptive_dense, RT(dense_threshold)
+        adaptive_dense, RT(dense_threshold), def_pos
     )
+
+    # Fast path: full-rank (no deficiency) or the adaptive-dense fallback fired
+    # (geqp3 already produces a minimum-residual factorization for the dense
+    # tail). Either way pass 1's result is correct and final — single pass. This
+    # preserves the byte-identical, zero-allocation full-rank behavior.
+    if isempty(def_pos) || F1.k_dense != 0
+        return F1
+    end
+
+    # Rank-deficient: iterate the deferral to a FIXED POINT. The numeric kernel's
+    # rank test is order-dependent: a column flagged deficient (residual <= tol)
+    # under one elimination order can become an INDEPENDENT pivot under another
+    # once the columns spanning it are themselves deferred. So a single re-pass
+    # (move pass-1's deficient set to the end) is not a fixed point under
+    # chained/overlapping mutual dependence: it can leave an interleaved zero
+    # pivot — the exact #23 pathology — and the basic back-substitution in
+    # `_usolve!` is then non-minimum.
+    #
+    # We instead grow a confirmed LEADING-INDEPENDENT set `is_indep` (by original
+    # column index) and order q = [is_indep cols, in confirmation order; the rest,
+    # in their current order]. Key monotonicity: a column that pivots nonzero with
+    # a given set of predecessors still pivots nonzero with any SUBSET of them
+    # (removing projections cannot shrink its residual). Placing `is_indep` first,
+    # in the stable order they were confirmed, makes each confirmed column's
+    # predecessors a subset of its predecessors at confirmation time, so it stays
+    # nonzero. Hence `is_indep` only GROWS (bounded by n) — the loop terminates in
+    # <= (n - rnk) iterations. At convergence no column outside `is_indep` pivots
+    # nonzero, so every zero pivot trails (positions > rnk) and `_usolve!`'s basic
+    # back-substitution is the true minimum-residual solve.
+    is_indep = ws.is_indep  # length-n membership marker; persists across passes
+    if length(is_indep) < n
+        resize!(is_indep, n)
+    end
+    @inbounds for j in 1:n
+        is_indep[j] = 0
+    end
+    # `indep_order` lists confirmed-independent columns in confirmation order
+    # (stable predecessors); `def_pos` from pass 1 are the zero-pivot positions,
+    # so every OTHER position is an independent pivot to seed the set.
+    indep_order = Vector{Int}(undef, n)
+    n_indep = 0
+    @inbounds for k in def_pos
+        is_indep[sym_use.q[k]] = -1  # temporary mark: this position is deficient
+    end
+    @inbounds for k in 1:n
+        j = sym_use.q[k]
+        if is_indep[j] == 0
+            is_indep[j] = 1
+            n_indep += 1
+            indep_order[n_indep] = j
+        end
+    end
+    @inbounds for j in 1:n
+        is_indep[j] == -1 && (is_indep[j] = 0)
+    end
+
+    sym_cur = sym_use
+    F_cur = F1
+    # Hard safety bound: `is_indep` grows by >= 1 each non-converged iteration and
+    # is bounded by n, so n iterations is a strict upper bound. Exceeding it
+    # signals a logic error (non-monotone `is_indep`), not a numerical edge case.
+    local F_out::CSRQRFactorization
+    converged = false
+    iters = 0
+    while iters < n
+        iters += 1
+
+        # q_next = [confirmed-independent cols in confirmation order; remaining
+        # cols in current q-order]. The remaining (not-yet-confirmed) columns are
+        # the only ones that can still pivot zero. A fresh array is required:
+        # `_rebuild_symbolic_for_q` keeps the passed q by reference as `sym.q`, so
+        # reusing one buffer across iterations would alias and clobber `sym_cur.q`.
+        q_next = Vector{Int}(undef, n)
+        @inbounds for t in 1:n_indep
+            q_next[t] = indep_order[t]
+        end
+        pos = n_indep + 1
+        @inbounds for k in 1:n
+            j = sym_cur.q[k]
+            if is_indep[j] == 0
+                q_next[pos] = j
+                pos += 1
+            end
+        end
+
+        # If the order already matches and pass `iters-1`'s factorization had all
+        # zero pivots trailing, no re-factor is needed. This is true exactly when
+        # the current factorization's nonzero pivots are precisely the leading
+        # `n_indep` positions, which holds iff q_next == sym_cur.q here.
+        if iters == 1 && q_next == sym_cur.q
+            # Pass 1 already has every zero pivot trailing (e.g. only the
+            # structural zeros pre-trailed by the norm repivot were deficient).
+            F_out = F_cur
+            converged = true
+            break
+        end
+
+        # Rebuild the value-independent symbolic for the forced order q_next and
+        # re-permute S = (P A Q_next).
+        qn, pinvn, parentn, leftmostn, m2n, vnzn, rnzn, rcountn =
+            _rebuild_symbolic_for_q(
+            sym_cur.pattern_rowptr, sym_cur.pattern_colval,
+            sym_cur.m, sym_cur.n, q_next
+        )
+        sym_next = CSRQRSymbolic(
+            sym_cur.m, sym_cur.n, m2n, qn, pinvn, parentn, leftmostn,
+            vnzn, rnzn, rcountn, sym_cur.ordering, sym_cur.pattern_rowptr,
+            sym_cur.pattern_colval, sym_cur.workspace
+        )
+        ws_next = _get_workspace(T, sym_next, nnz_A)::_CSRQRWorkspace{T, RT}
+        _permute_pq!(ws_next, sym_next.pinv, sym_next.q, m, n)
+
+        # Re-factor in place over F_cur, collecting the zero-pivot positions.
+        empty!(def_pos)
+        F_cur = _csc_qr_numeric!(
+            ws_next, sym_next, tol_use, tol2, F_cur, RT(drop_tol),
+            adaptive_dense, RT(dense_threshold), def_pos
+        )
+
+        # Promote every NONZERO-pivot column (position not in def_pos) not yet
+        # confirmed — a previously-deferred column that pivoted nonzero this pass
+        # and must move into the leading block. First mark this pass's zero-pivot
+        # DEFERRED columns as -1 so the promotion scan skips them. The `== 0`
+        # guard never demotes a confirmed column: those keep nonzero pivots by
+        # the subset-of-predecessors argument, so they should not appear in
+        # def_pos, and the guard preserves monotonicity if a threshold edge ever
+        # flags one.
+        @inbounds for k in def_pos
+            j = sym_next.q[k]
+            is_indep[j] == 0 && (is_indep[j] = -1)
+        end
+        new_indep = 0
+        @inbounds for k in 1:n
+            j = sym_next.q[k]
+            if is_indep[j] == 0
+                is_indep[j] = 1
+                n_indep += 1
+                indep_order[n_indep] = j
+                new_indep += 1
+            end
+        end
+        @inbounds for k in def_pos
+            j = sym_next.q[k]
+            is_indep[j] == -1 && (is_indep[j] = 0)
+        end
+
+        sym_cur = sym_next
+        if new_indep == 0
+            # Converged: no deferred column pivots nonzero, so the confirmed set
+            # is exactly the leading block and all zero pivots trail.
+            F_out = F_cur
+            converged = true
+            @debug "rank-deficient deferral converged" iters n rnk = F_out.rnk
+            break
+        end
+    end
+
+    converged ||
+        error(
+        "rank-deficient deferral did not converge in $n iterations; " *
+            "the confirmed-independent set should grow monotonically and be " *
+            "bounded by n (this indicates a logic error, not a numerical edge case)"
+    )
+    return F_out
 end
 
 # In-place CSR -> CSC of A, plus per-column squared norms and ||A||_F^2.
@@ -1095,7 +1277,8 @@ function _csc_qr_numeric!(
         F::Union{Nothing, CSRQRFactorization},
         drop_tol::RT = zero(RT),
         adaptive_dense::Bool = false,
-        dense_threshold::RT = RT(0.4)
+        dense_threshold::RT = RT(0.4),
+        def_pos::Union{Nothing, Vector{Int}} = nothing
     ) where {T, RT}
     drop_active = drop_tol > zero(RT)
     drop_tol2 = drop_tol * drop_tol
@@ -1303,6 +1486,7 @@ function _csc_qr_numeric!(
             for q in 1:vlen
                 x[vrows[q]] = zero(T)
             end
+            def_pos === nothing || push!(def_pos, k)
             continue
         end
 
@@ -1331,6 +1515,8 @@ function _csc_qr_numeric!(
             end
             if abs(alpha) > tol_use
                 rnk += 1
+            elseif def_pos !== nothing
+                push!(def_pos, k)
             end
             continue
         end
