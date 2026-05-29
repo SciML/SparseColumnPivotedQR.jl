@@ -1553,13 +1553,18 @@ function _csc_qr_numeric!(
         # The row indices are written into vrows[1..vlen], with vrows[1] = k
         # (the diagonal row) and the remaining entries being rows > k with
         # x[i] != 0.
+        #
+        # Branch-free scan: the active range k+1:m2 is long (~n) while only a
+        # handful of entries are nonzero, so a data-dependent `if` mispredicts
+        # heavily. We instead speculatively store `i` and advance `vlen` only on
+        # a hit (`ifelse`), overwriting the speculative slot next iteration when
+        # it was a miss. Identical result (same indices, same order); `vrows` is
+        # sized m2 and the speculative write index is at most m2-k+1 <= m2.
         vrows[1] = k
         vlen = 1
         for i in (k + 1):m2
-            if x[i] != zero(T)
-                vlen += 1
-                vrows[vlen] = i
-            end
+            vrows[vlen + 1] = i
+            vlen += ifelse(x[i] != zero(T), 1, 0)
         end
 
         # --- 3) Build Householder for x[vrows[1..vlen]] -----------------
@@ -2044,42 +2049,47 @@ function _usolve!(
     # one of these slots; identify it. Iterate column k from bottom to top.
     @inbounds for k in n:-1:1
         rc1 = Rp[k]; rc2 = Rp[k + 1] - 1
-        # Find the diagonal (the entry with row index k). For an in-order
-        # CSC R (which our emit guarantees: pattern emitted in ereach
-        # topological order, then diag last), the diagonal is at the LAST
-        # slot Rp[k+1]-1. Verify and fall back to search if not.
-        diag_p = 0
+        # The emit guarantees an in-order CSC column with the diagonal at the
+        # LAST slot Rp[k+1]-1 for sparse columns. Fast path: divide by that
+        # diagonal and subtract over rc1:rc2-1 with NO per-iteration
+        # diagonal-skip branch. Out-of-order columns (the dense tail) take the
+        # general search/skip path below. Both branches do identical arithmetic.
         if rc2 >= rc1 && Ri[rc2] == k
-            diag_p = rc2
+            d = Rx[rc2]
+            if abs(d) <= tol_use || d == 0
+                # Rank-deficient row; set z[k] = 0 (basic LS solution).
+                z[k] = zero(T)
+                continue
+            end
+            z[k] /= d
+            zk = z[k]
+            for p in rc1:(rc2 - 1)
+                z[Ri[p]] -= Rx[p] * zk
+            end
         else
+            diag_p = 0
             for p in rc1:rc2
                 if Ri[p] == k
-                    diag_p = p; break
+                    diag_p = p
+                    break
                 end
             end
-        end
-        if diag_p == 0
-            # Missing diagonal: column is structurally absent. Treat as
-            # rank-deficient: set z[k] = 0.
-            z[k] = zero(T)
-            continue
-        end
-        d = Rx[diag_p]
-        if abs(d) <= tol_use || d == 0
-            # Rank-deficient row; set z[k] = 0 (basic LS solution).
-            z[k] = zero(T)
-            # Still need to subtract z[k] contributions from above rows in
-            # higher steps? No: we go k from n down, so above rows handle
-            # themselves. We just don't propagate the zero down.
-            continue
-        end
-        z[k] /= d
-        zk = z[k]
-        # Subtract z[k] * R[i, k] from z[i] for i < k.
-        for p in rc1:rc2
-            p == diag_p && continue
-            i = Ri[p]
-            z[i] -= Rx[p] * zk
+            if diag_p == 0
+                # Missing diagonal: structurally absent column → z[k] = 0.
+                z[k] = zero(T)
+                continue
+            end
+            d = Rx[diag_p]
+            if abs(d) <= tol_use || d == 0
+                z[k] = zero(T)
+                continue
+            end
+            z[k] /= d
+            zk = z[k]
+            for p in rc1:rc2
+                p == diag_p && continue
+                z[Ri[p]] -= Rx[p] * zk
+            end
         end
     end
     return z
