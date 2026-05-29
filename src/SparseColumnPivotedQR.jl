@@ -316,6 +316,21 @@ mutable struct _CSRQRWorkspace{T, RT}
     # Cannot alias `w` because the numeric kernel clobbers `w` each pass while
     # this must persist across passes.
     is_indep::Vector{Int}
+    # Pooled scratch for the rank-deficient defer-repivot fixed-point loop so a
+    # fixed-pattern rank-deficient refactor is also zero-alloc in steady state.
+    # `defer_indep_order` (length n) lists confirmed-independent columns in
+    # confirmation order — pure scratch, never escapes the kernel. `defer_q_a`
+    # and `defer_q_b` (length n) are the two ping-pong buffers for the forced
+    # q-order passed to `_rebuild_symbolic_for_q` (which keeps it by reference as
+    # `sym.q`); two are needed because each iteration reads `sym_cur.q` (one of
+    # the buffers, after a rebuild) while writing the next order, so we always
+    # write into the buffer NOT currently aliased by `sym_cur.q`. The converged
+    # order ends up as `F.sym.q`; it is overwritten in place by the next
+    # refactor before any `ldiv!` reads it. Sized lazily on the first
+    # rank-deficient call (length n), so the full-rank path does no heap work.
+    defer_indep_order::Vector{Int}
+    defer_q_a::Vector{Int}
+    defer_q_b::Vector{Int}
     # Generation counter used as a "stamp base" for the `w` marker array so
     # that the numeric kernel doesn't have to zero `w` between calls. The
     # stamp value used in the kernel is `gen * (n + 1) + k`; an `n`-sized
@@ -369,6 +384,9 @@ function _alloc_workspace(
         Vector{Int}(undef, n),
         zeros(Int, n),
         Vector{Int}(undef, m2),
+        Int[],
+        Int[],
+        Int[],
         Int[],
         Int[],
         0,
@@ -1124,8 +1142,13 @@ function _factor_kernel(
     end
     # `indep_order` lists confirmed-independent columns in confirmation order
     # (stable predecessors); `def_pos` from pass 1 are the zero-pivot positions,
-    # so every OTHER position is an independent pivot to seed the set.
-    indep_order = Vector{Int}(undef, n)
+    # so every OTHER position is an independent pivot to seed the set. Pooled on
+    # the workspace (pure scratch, never escapes the kernel) so the repivot loop
+    # adds no heap work in steady state.
+    indep_order = ws.defer_indep_order
+    if length(indep_order) < n
+        resize!(indep_order, n)
+    end
     n_indep = 0
     @inbounds for k in def_pos
         is_indep[sym_use.q[k]] = -1  # temporary mark: this position is deficient
@@ -1142,6 +1165,17 @@ function _factor_kernel(
         is_indep[j] == -1 && (is_indep[j] = 0)
     end
 
+    # Two pooled ping-pong buffers for the forced q-order. Each iteration writes
+    # into the buffer NOT currently aliased by `sym_cur.q` (which, after a
+    # rebuild, is one of these two), so the read of `sym_cur.q` is never
+    # clobbered. Sized lazily here.
+    if length(ws.defer_q_a) < n
+        resize!(ws.defer_q_a, n)
+    end
+    if length(ws.defer_q_b) < n
+        resize!(ws.defer_q_b, n)
+    end
+
     sym_cur = sym_use
     F_cur = F1
     # Hard safety bound: `is_indep` grows by >= 1 each non-converged iteration and
@@ -1155,10 +1189,12 @@ function _factor_kernel(
 
         # q_next = [confirmed-independent cols in confirmation order; remaining
         # cols in current q-order]. The remaining (not-yet-confirmed) columns are
-        # the only ones that can still pivot zero. A fresh array is required:
-        # `_rebuild_symbolic_for_q` keeps the passed q by reference as `sym.q`, so
-        # reusing one buffer across iterations would alias and clobber `sym_cur.q`.
-        q_next = Vector{Int}(undef, n)
+        # the only ones that can still pivot zero. `_rebuild_symbolic_for_q`
+        # keeps the passed q by reference as `sym.q`, so we must not reuse the
+        # buffer that `sym_cur.q` currently aliases — pick the other pooled
+        # ping-pong buffer. (When `sym_cur.q` is `sym_use.q`, neither pooled
+        # buffer is aliased and either is safe.)
+        q_next = sym_cur.q === ws.defer_q_a ? ws.defer_q_b : ws.defer_q_a
         @inbounds for t in 1:n_indep
             q_next[t] = indep_order[t]
         end
@@ -1637,11 +1673,16 @@ function _csc_qr_numeric!(
     @inbounds for k in 1:n
         kstamp = wbase + k
         # --- 1) ereach pattern of R[:,k] + scatter S[:,k] into x ---------
+        # `imax` upper-bounds the largest row index that gets a nonzero written
+        # into `x` (rows > k), so the V-pattern scan below can stop at `imax`
+        # instead of walking to m2. Seeded at the diagonal row k.
+        imax = k
         top = n + 1
         c1 = colptr[k]; c2 = colptr[k + 1] - 1
         for p in c1:c2
             i = rowval[p]
             x[i] = nzval[p]
+            i > imax && (imax = i)
             lm = leftmost[i]
             if lm > 0 && lm <= k
                 len = 0
@@ -1684,6 +1725,9 @@ function _csc_qr_numeric!(
             if bk != 0 && tau != 0
                 tau_b = T(bk) * tau
                 _hh_scatter!(Vx, Vi, x, vc1, vc2, tau_b)
+                # V[:,p_idx] is stored in ascending row order, so Vi[vc2] is its
+                # largest touched row; fold it into the scan bound.
+                vc2 >= vc1 && Vi[vc2] > imax && (imax = Vi[vc2])
             end
             # Emit R[p_idx, k] = x[p_idx]; clear x[p_idx].
             if rnz_total + 1 > length(Ri)
@@ -1708,7 +1752,7 @@ function _csc_qr_numeric!(
         # sized m2 and the speculative write index is at most m2-k+1 <= m2.
         vrows[1] = k
         vlen = 1
-        for i in (k + 1):m2
+        for i in (k + 1):imax
             vrows[vlen + 1] = i
             vlen += ifelse(x[i] != zero(T), 1, 0)
         end
