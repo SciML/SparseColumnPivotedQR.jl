@@ -161,6 +161,76 @@ end
         @test norm(A * x - b) ≈ rref atol = 1.0e-8
     end
 
+    @testset "Issue #23: chained mutual dependence needs a deferral fixed point" begin
+        # Several columns set EQUAL to the same vector that is itself a
+        # combination of two others: overlapping/chained mutual dependence. A
+        # SINGLE deferral re-pass is NOT a fixed point here — moving the first
+        # pass's deficient set to the end changes the elimination order, so a
+        # column deficient in one order becomes an independent pivot in another,
+        # leaving an INTERLEAVED zero pivot (the #23 pathology recurs). The
+        # deferral must iterate to a fixed point. This sweep includes seeds that
+        # require two iterations; with only a single re-pass these would report a
+        # non-minimum residual.
+        function gen_chained(seed)
+            Random.seed!(seed)
+            m, n = 47, 52
+            A = sprandn(m, n, rand((4, 6, 10)) / n)
+            for j in 1:min(m, n)
+                A[j, j] += 10.0
+            end
+            for _ in 1:rand(1:3)
+                g = rand(2:5)
+                v = 1.5 .* A[:, rand(1:n)] .+ 0.7 .* A[:, rand(1:n)]
+                for c in rand(1:n, g)
+                    A[:, c] = v
+                end
+            end
+            return A, randn(m)
+        end
+
+        # Per-position pivot magnitudes of R (in q-order). All zero pivots must
+        # form a contiguous TRAILING block; an interleaved zero would mean the
+        # back-substitution is non-minimum.
+        function trailing_zeros_ok(F)
+            n = F.n
+            Rp, Ri, Rx = F.R_colptr, F.R_rowval, F.R_nzval
+            seen_zero = false
+            for k in 1:n
+                d = zero(eltype(Rx))
+                for p in Rp[k]:(Rp[k + 1] - 1)
+                    Ri[p] == k && (d = Rx[p])
+                end
+                isz = abs(d) <= F.tol
+                if isz
+                    seen_zero = true
+                elseif seen_zero
+                    return false  # nonzero pivot after a zero: interleaved
+                end
+            end
+            return true
+        end
+
+        for seed in 5000:5030
+            A, b = gen_chained(seed)
+            Am = Matrix(A)
+            svdrank = rank(Am)
+            rref = norm(A * (pinv(Am) * b) - b)
+            Acsr = to_csr(A)
+            for ordering in (:natural, :amd)
+                F = csr_factor(Acsr, csr_analyze(Acsr; ordering = ordering))
+                x = F \ b
+                @test all(isfinite, x)
+                # Restrict the min-residual assertion to the cases where the
+                # revealed rank agrees with the SVD rank; a rank-threshold
+                # disagreement is a separate tolerance question, not a solve bug.
+                if rank(F) == svdrank
+                    @test trailing_zeros_ok(F)
+                    @test norm(A * x - b) ≈ rref atol = 1.0e-7
+                end
+            end
+        end
+    end
+
     @testset "Bundled 199x199 matrices (mix of rank-deficient)" begin
         # Test fixtures checked in under `test/matrices/`. Each file contains
         # `sparse(...)` on line 1 and a `b` vector on line 2. See
