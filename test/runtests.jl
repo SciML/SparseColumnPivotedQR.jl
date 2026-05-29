@@ -16,6 +16,16 @@ function build_csr(A::AbstractMatrix{T}) where {T}
     return SparseMatrixCSR(transpose(sparse(transpose(Acsc))))
 end
 
+# Steady-state allocation of one `csr_refactor!(adaptive_dense=true)` and one
+# `ldiv!`, measured inside a function barrier so the `@allocated` is not
+# perturbed by boxed captures in the calling (testset) scope.
+function _refactor_alloc(F, Acsr)
+    return @allocated csr_refactor!(F, Acsr; adaptive_dense = true)
+end
+function _ldiv_alloc(x, F, b)
+    return @allocated ldiv!(x, F, b)
+end
+
 @testset "SparseColumnPivotedQR" begin
 
     @testset "Identity matrix" begin
@@ -637,6 +647,43 @@ end
             ldiv!(xd, Fd, b)
             ldiv!(xd, Fd, b)
             @test (@allocated ldiv!(xd, Fd, b)) == 0
+        end
+    end
+
+    @testset "Pooled dense tail: csr_refactor!(adaptive_dense) is zero-alloc" begin
+        # On a dense-fill fixed pattern the adaptive-dense fallback fires; its
+        # D / top_R / jpvt / dtau / q_eff staging and the LAPACK geqp3 work
+        # buffer are pooled on the symbolic's workspace, so a steady-state
+        # `csr_refactor!(adaptive_dense=true)` does no heap work (the dense-tail
+        # dims are fixed once the pattern is). Verified for the four BLAS float
+        # types geqp3 supports.
+        dir = joinpath(@__DIR__, "matrices")
+        files = sort(filter(f -> endswith(f, ".txt"), readdir(dir; join = true)))
+        f = first(files)
+        lines = split(read(f, String), '\n'; keepempty = false)
+        A64 = eval(Meta.parse(strip(lines[1])))
+        n = size(A64, 2)
+        for T in (Float64, Float32, ComplexF64, ComplexF32)
+            A = T <: Complex ? T.(A64) .+ T(0.1im) .* (A64 .!= 0) : T.(A64)
+            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            b = ones(T, size(A, 1))
+            x = zeros(T, n)
+            sym = csr_analyze(Acsr; ordering = :amd)
+            F = csr_factor(Acsr, sym; adaptive_dense = true)
+            @test F.k_dense > 0   # confirm the dense fallback fired
+            # Warm up the pooled dense buffers (first transition sizes them and
+            # queries the geqp3 lwork once).
+            csr_refactor!(F, Acsr; adaptive_dense = true)
+            ldiv!(x, F, b)
+            csr_refactor!(F, Acsr; adaptive_dense = true)
+            ldiv!(x, F, b)
+            @test _refactor_alloc(F, Acsr) == 0
+            @test _ldiv_alloc(x, F, b) == 0
+            # Repeated refactors must be deterministic (pooled-buffer reuse must
+            # not perturb the result).
+            x1 = zeros(T, n); csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x1, F, b)
+            x2 = zeros(T, n); csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x2, F, b)
+            @test x1 == x2
         end
     end
 
