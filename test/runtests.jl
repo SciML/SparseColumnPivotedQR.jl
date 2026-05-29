@@ -25,6 +25,33 @@ end
 function _ldiv_alloc(x, F, b)
     return @allocated ldiv!(x, F, b)
 end
+# Function barrier for the pooled-dense zero-alloc check: dispatching on the
+# concrete `T` and the concrete runtime type of `A64` keeps the per-element
+# eltype concrete (a `for T in (...)` testset body reads `A64` as a boxed `Any`,
+# which makes `T.(A64)` yield an `Any`-eltype matrix on Julia 1.10). Returns
+# (k_dense, refactor!-alloc, ldiv!-alloc, deterministic?).
+function _dense_zeroalloc_case(::Type{T}, A64, n) where {T}
+    # `convert` forces a concrete eltype: the complex mixed sparse broadcast
+    # below yields an `Any`-eltype result on Julia 1.10 (sparse-broadcast
+    # inference limitation) even with a concrete `A64`, which would feed
+    # `real(Any)`/`zero(Any)` into the factor.
+    A = convert(
+        SparseMatrixCSC{T, Int},
+        T <: Complex ? (T.(A64) .+ T(0.1im) .* (A64 .!= 0)) : T.(A64),
+    )
+    Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+    b = ones(T, size(A, 1))
+    x = zeros(T, n)
+    sym = csr_analyze(Acsr; ordering = :amd)
+    F = csr_factor(Acsr, sym; adaptive_dense = true)
+    csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x, F, b)   # warm
+    csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x, F, b)
+    ra = _refactor_alloc(F, Acsr)
+    la = _ldiv_alloc(x, F, b)
+    x1 = zeros(T, n); csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x1, F, b)
+    x2 = zeros(T, n); csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x2, F, b)
+    return F.k_dense, ra, la, x1 == x2
+end
 
 @testset "SparseColumnPivotedQR" begin
 
@@ -659,31 +686,17 @@ end
         # types geqp3 supports.
         dir = joinpath(@__DIR__, "matrices")
         files = sort(filter(f -> endswith(f, ".txt"), readdir(dir; join = true)))
-        f = first(files)
-        lines = split(read(f, String), '\n'; keepempty = false)
+        lines = split(read(first(files), String), '\n'; keepempty = false)
         A64 = eval(Meta.parse(strip(lines[1])))
         n = size(A64, 2)
         for T in (Float64, Float32, ComplexF64, ComplexF32)
-            A = T <: Complex ? T.(A64) .+ T(0.1im) .* (A64 .!= 0) : T.(A64)
-            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
-            b = ones(T, size(A, 1))
-            x = zeros(T, n)
-            sym = csr_analyze(Acsr; ordering = :amd)
-            F = csr_factor(Acsr, sym; adaptive_dense = true)
-            @test F.k_dense > 0   # confirm the dense fallback fired
-            # Warm up the pooled dense buffers (first transition sizes them and
-            # queries the geqp3 lwork once).
-            csr_refactor!(F, Acsr; adaptive_dense = true)
-            ldiv!(x, F, b)
-            csr_refactor!(F, Acsr; adaptive_dense = true)
-            ldiv!(x, F, b)
-            @test _refactor_alloc(F, Acsr) == 0
-            @test _ldiv_alloc(x, F, b) == 0
-            # Repeated refactors must be deterministic (pooled-buffer reuse must
-            # not perturb the result).
-            x1 = zeros(T, n); csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x1, F, b)
-            x2 = zeros(T, n); csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x2, F, b)
-            @test x1 == x2
+            # Function barrier (see `_dense_zeroalloc_case`) so the eltype is
+            # concrete on all Julia versions.
+            kd, refactor_alloc, ldiv_alloc, deterministic = _dense_zeroalloc_case(T, A64, n)
+            @test kd > 0                # the dense fallback fired
+            @test refactor_alloc == 0   # pooled dense scratch ⇒ zero-alloc refactor!
+            @test ldiv_alloc == 0       # pooled solve scratch ⇒ zero-alloc ldiv!
+            @test deterministic         # repeated refactors give identical x
         end
     end
 
