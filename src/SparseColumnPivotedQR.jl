@@ -84,6 +84,10 @@ mutable struct _CSRQRWorkspace{T, RT}
     s::Vector{Int}
     w::Vector{Int}
     vrows::Vector{Int}
+    # Positions (in the current q-order) of columns the numeric kernel flags
+    # rank-deficient. Reused across calls via `empty!` so the full-rank path
+    # does no heap work; consumed by `_factor_kernel`'s deferral re-pass.
+    def_pos::Vector{Int}
     # Generation counter used as a "stamp base" for the `w` marker array so
     # that the numeric kernel doesn't have to zero `w` between calls. The
     # stamp value used in the kernel is `gen * (n + 1) + k`; an `n`-sized
@@ -109,6 +113,7 @@ function _alloc_workspace(
         Vector{Int}(undef, n),
         zeros(Int, n),
         Vector{Int}(undef, m2),
+        Int[],
         0,
     )
 end
@@ -805,8 +810,77 @@ function _factor_kernel(
     # Apply row+column permutation S = (P A Q) into workspace buffers.
     _permute_pq!(ws, sym_use.pinv, sym_use.q, m, n)
 
-    return _csc_qr_numeric!(
+    # Pass 1: factor and collect the positions (in sym_use.q order) of any
+    # columns the kernel flags rank-deficient. `def_pos` is workspace-owned and
+    # reset here, so the common full-rank path does no extra heap work.
+    def_pos = ws.def_pos
+    empty!(def_pos)
+    F1 = _csc_qr_numeric!(
         ws, sym_use, tol_use, tol2, F, RT(drop_tol),
+        adaptive_dense, RT(dense_threshold), def_pos
+    )
+
+    # Fast path: full-rank (no deficiency) or the adaptive-dense fallback fired
+    # (geqp3 already produces a minimum-residual factorization for the dense
+    # tail). Either way pass 1's result is correct and final — single pass.
+    if isempty(def_pos) || F1.k_dense != 0
+        return F1
+    end
+
+    # Rank-deficient: build q' that moves the flagged columns to the end so the
+    # leading rnk x rnk block of R is nonsingular upper-triangular with all zero
+    # pivots trailing. Then `_usolve!`'s basic back-substitution becomes the
+    # true minimum-residual solve. Deficient columns emit identity Householders,
+    # so they never enter any later column's projection: the independent prefix
+    # is placement-invariant and a single re-pass is a fixed point.
+    q_prime = Vector{Int}(undef, n)
+    isdef = ws.w  # length-n scratch; safe to clobber, the next pass re-stamps it
+    @inbounds for k in 1:n
+        isdef[k] = 0
+    end
+    @inbounds for k in def_pos
+        isdef[k] = 1
+    end
+    pos = 1
+    @inbounds for k in 1:n
+        if isdef[k] == 0
+            q_prime[pos] = sym_use.q[k]
+            pos += 1
+        end
+    end
+    @inbounds for k in 1:n
+        if isdef[k] != 0
+            q_prime[pos] = sym_use.q[k]
+            pos += 1
+        end
+    end
+
+    # If nothing actually moved (e.g. the only deficient columns were the
+    # structural zeros already trailed by `_maybe_repivot_zero_cols_from_norms`),
+    # pass 1 is already correct: all zero pivots trail. Skip the re-pass.
+    if q_prime == sym_use.q
+        return F1
+    end
+
+    # Rebuild the value-independent symbolic for q' (reusing the same machinery
+    # the structural-zero repivot uses) and re-permute S = (P A Q').
+    q2, pinv2, parent2, leftmost2, m2_2, vnz2, rnz2, rcount2 =
+        _rebuild_symbolic_for_q(
+        sym_use.pattern_rowptr, sym_use.pattern_colval,
+        sym_use.m, sym_use.n, q_prime
+    )
+    sym2 = CSRQRSymbolic(
+        sym_use.m, sym_use.n, m2_2, q2, pinv2, parent2, leftmost2,
+        vnz2, rnz2, rcount2, sym_use.ordering, sym_use.pattern_rowptr,
+        sym_use.pattern_colval, sym_use.workspace
+    )
+    ws2 = _get_workspace(T, sym2, nnz_A)::_CSRQRWorkspace{T, RT}
+    _permute_pq!(ws2, sym2.pinv, sym2.q, m, n)
+
+    # Pass 2: re-factor in place over F1 (no collection needed — the deficient
+    # set is stable). F1 carries sym2 on return so the solve is consistent.
+    return _csc_qr_numeric!(
+        ws2, sym2, tol_use, tol2, F1, RT(drop_tol),
         adaptive_dense, RT(dense_threshold)
     )
 end
@@ -1088,7 +1162,8 @@ function _csc_qr_numeric!(
         F::Union{Nothing, CSRQRFactorization},
         drop_tol::RT = zero(RT),
         adaptive_dense::Bool = false,
-        dense_threshold::RT = RT(0.4)
+        dense_threshold::RT = RT(0.4),
+        def_pos::Union{Nothing, Vector{Int}} = nothing
     ) where {T, RT}
     drop_active = drop_tol > zero(RT)
     drop_tol2 = drop_tol * drop_tol
@@ -1296,6 +1371,7 @@ function _csc_qr_numeric!(
             for q in 1:vlen
                 x[vrows[q]] = zero(T)
             end
+            def_pos === nothing || push!(def_pos, k)
             continue
         end
 
@@ -1324,6 +1400,8 @@ function _csc_qr_numeric!(
             end
             if abs(alpha) > tol_use
                 rnk += 1
+            elseif def_pos !== nothing
+                push!(def_pos, k)
             end
             continue
         end

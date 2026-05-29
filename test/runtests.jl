@@ -101,6 +101,66 @@ end
         @test norm(Adense * x - b) / max(norm(b), 1.0) < 1.0e-8
     end
 
+    @testset "Issue #23: rank-deficient LS reaches minimum residual" begin
+        # A tall, multi-defect, clean-rank-cliff problem where the dependent
+        # columns are discovered DURING numeric factorization (not structural
+        # zeros). With AMD ordering these deficient columns land interleaved
+        # among independent ones; the fix defers them to the trailing block so
+        # the basic back-substitution becomes the true minimum-residual solve.
+        # The bug returned a finite but non-minimum solution under :amd.
+        Random.seed!(7)
+        m, n, nd = 260, 200, 20
+        A = sprandn(m, n, 5 / n)
+        for j in 1:n
+            A[j, j] += 10.0
+        end
+        for (i, t) in enumerate((n - nd + 1):n)
+            s1 = ((2i - 1) % (n - nd)) + 1
+            s2 = ((3i) % (n - nd)) + 1
+            A[:, t] .= 1.5A[:, s1] .+ 0.7A[:, s2]
+        end
+        b = randn(m)
+        Acsr = to_csr(A)
+
+        # Ground-truth minimum residual: SVD pseudoinverse (unique).
+        rref = norm(A * (pinv(Matrix(A)) * b) - b)
+        # SPQR basic solver also attains the minimum.
+        rspqr = norm(A * (qr(A) \ b) - b)
+        @test rspqr ≈ rref atol = 1.0e-8
+
+        for ordering in (:amd, :natural)
+            F = csr_factor(Acsr, csr_analyze(Acsr; ordering = ordering))
+            x = F \ b
+            @test rank(F) == n - nd          # clean rank cliff revealed
+            @test all(isfinite, x)            # no NaN/Inf
+            @test norm(A * x - b) ≈ rref atol = 1.0e-8   # minimum residual
+        end
+    end
+
+    @testset "Issue #23: square rank-deficient interleaved dependence" begin
+        # Square analogue: dependent columns interleaved by AMD ordering.
+        Random.seed!(8)
+        nsq, nd = 140, 12
+        A = sprandn(nsq, nsq, 6 / nsq)
+        for j in 1:nsq
+            A[j, j] += 8.0
+        end
+        for (i, t) in enumerate((nsq - nd + 1):nsq)
+            s1 = ((2i) % (nsq - nd)) + 1
+            s2 = ((5i) % (nsq - nd)) + 1
+            A[:, t] .= 2.0A[:, s1] .- 0.5A[:, s2]
+        end
+        b = randn(nsq)
+        Acsr = to_csr(A)
+        rref = norm(A * (pinv(Matrix(A)) * b) - b)
+
+        F = csr_factor(Acsr, csr_analyze(Acsr; ordering = :amd))
+        x = F \ b
+        @test rank(F) == nsq - nd
+        @test all(isfinite, x)
+        @test norm(A * x - b) ≈ rref atol = 1.0e-8
+    end
+
     @testset "Bundled 199x199 matrices (mix of rank-deficient)" begin
         # Test fixtures checked in under `test/matrices/`. Each file contains
         # `sparse(...)` on line 1 and a `b` vector on line 2. See
