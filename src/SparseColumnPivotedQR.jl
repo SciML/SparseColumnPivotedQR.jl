@@ -89,6 +89,11 @@ mutable struct _CSRQRWorkspace{T, RT}
     # stamp value used in the kernel is `gen * (n + 1) + k`; an `n`-sized
     # `w` is then compared against this monotonic generation-encoded stamp.
     wgen::Int
+    # Pooled scratch for the solve path so `ldiv!` is allocation-free in steady
+    # state (mirrors the zero-alloc factor path). `solve_work` is sized m2,
+    # `solve_xprime` is sized n.
+    solve_work::Vector{T}
+    solve_xprime::Vector{T}
 end
 
 function _alloc_workspace(
@@ -110,6 +115,8 @@ function _alloc_workspace(
         zeros(Int, n),
         Vector{Int}(undef, m2),
         0,
+        zeros(T, m2),
+        Vector{T}(undef, n),
     )
 end
 
@@ -1677,11 +1684,26 @@ function _apply_QH!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
         # Apply dense Householders to work[ks+1 .. ks+m_active] via LAPACK.
         # The dense block is stored in F.D (m_active x n_active), tau in F.dtau.
         # work has length m2; the dense block was built on rows ks+1..m2 of x.
+        # Apply Qᴴ of the dense tail manually: allocation-free (LAPACK ormqr!
+        # allocates an internal work buffer per call) and generic over eltype.
+        # Q = H₁…H_r, H_j = I − τ_j v_j v_jᴴ, v_j in strict-lower D (v_j[j]=1).
+        # Qᴴ applies H_jᴴ for j=1..r: y −= conj(τ_j)(v_jᴴ y) v_j.
         m_active = size(F.D, 1)
-        if m_active > 0 && !isempty(F.dtau)
-            sub = @view work[(ks + 1):(ks + m_active)]
-            trans = T <: Complex ? 'C' : 'T'
-            LinearAlgebra.LAPACK.ormqr!('L', trans, F.D, F.dtau, sub)
+        D = F.D; dtau = F.dtau; r = length(dtau)
+        if m_active > 0 && r > 0
+            @inbounds for j in 1:r
+                tj = dtau[j]
+                tj == zero(T) && continue
+                g = work[ks + j]
+                for i in (j + 1):m_active
+                    g += conj(D[i, j]) * work[ks + i]
+                end
+                c = conj(tj) * g
+                work[ks + j] -= c
+                for i in (j + 1):m_active
+                    work[ks + i] -= c * D[i, j]
+                end
+            end
         end
     end
     return work
@@ -1693,10 +1715,23 @@ function _apply_Q!(F::CSRQRFactorization{T}, work::Vector{T}) where {T}
     ks = F.k_dense
     # If we transitioned to dense, first apply dense H's (in reverse via 'N').
     if ks > 0
+        # Apply Q of the dense tail manually (allocation-free): H_j for j=r..1.
         m_active = size(F.D, 1)
-        if m_active > 0 && !isempty(F.dtau)
-            sub = @view work[(ks + 1):(ks + m_active)]
-            LinearAlgebra.LAPACK.ormqr!('L', 'N', F.D, F.dtau, sub)
+        D = F.D; dtau = F.dtau; r = length(dtau)
+        if m_active > 0 && r > 0
+            @inbounds for j in r:-1:1
+                tj = dtau[j]
+                tj == zero(T) && continue
+                g = work[ks + j]
+                for i in (j + 1):m_active
+                    g += conj(D[i, j]) * work[ks + i]
+                end
+                c = tj * g
+                work[ks + j] -= c
+                for i in (j + 1):m_active
+                    work[ks + i] -= c * D[i, j]
+                end
+            end
         end
     end
     n_sparse = ks == 0 ? n : ks
@@ -1790,8 +1825,22 @@ function LinearAlgebra.ldiv!(
     # otherwise carries the dense block's geqp3 column pivoting.
     q = F.q_eff
 
-    # Workspace sized to m2 (handles fictitious rows).
-    work = zeros(T, m2)
+    # Reuse pooled solve scratch on the symbolic's workspace when present
+    # (allocation-free steady state); fall back to fresh buffers otherwise.
+    ws = F.sym.workspace
+    local work::Vector{T}
+    local xprime::Vector{T}
+    if ws isa _CSRQRWorkspace{T, real(T)} &&
+            length(ws.solve_work) >= m2 && length(ws.solve_xprime) >= n
+        work = ws.solve_work
+        xprime = ws.solve_xprime
+    else
+        work = Vector{T}(undef, m2)
+        xprime = Vector{T}(undef, n)
+    end
+    @inbounds for i in 1:m2
+        work[i] = zero(T)
+    end
     @inbounds for i in 1:m
         work[pinv[i]] = b[i]
     end
@@ -1800,7 +1849,6 @@ function LinearAlgebra.ldiv!(
     _apply_QH!(F, work)
 
     # Solve R x' = work[1:n].
-    xprime = Vector{T}(undef, n)
     @inbounds for k in 1:n
         xprime[k] = work[k]
     end

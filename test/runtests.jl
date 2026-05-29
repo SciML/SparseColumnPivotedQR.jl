@@ -458,6 +458,58 @@ end
         @test norm(A1 * x - b) / norm(b) < 1.0e-10
     end
 
+    @testset "Pooled solve: ldiv! is zero-alloc steady-state" begin
+        Random.seed!(23)
+        n = 30
+        Asp = sprand(Float64, n, n, 0.2)
+        rows, cols, _ = findnz(Asp)
+        A1 = sparse(rows, cols, randn(length(rows)), n, n) + 4 * sparse(I, n, n)
+        Acsr1 = build_csr(Matrix(A1))
+        b = randn(n)
+        x = zeros(n)
+
+        F = csr_qr(Acsr1; ordering = :amd)
+        ldiv!(x, F, b)   # warm up the pooled solve buffers
+        ldiv!(x, F, b)
+
+        # Steady state: the solve reuses the symbolic's pooled scratch, so a
+        # provided-output ldiv! allocates nothing.
+        nbytes = @allocated ldiv!(x, F, b)
+        @test nbytes == 0
+        @test norm(A1 * x - b) / norm(b) < 1.0e-10
+    end
+
+    @testset "Dense-tail apply matches the LAPACK reference solve" begin
+        # The manual (allocation-free) dense-tail Householder apply must give
+        # the same solution as the pure-sparse path on the bundled dense-fill
+        # matrices, where adaptive_dense actually triggers.
+        dir = joinpath(@__DIR__, "matrices")
+        files = sort(filter(f -> endswith(f, ".txt"), readdir(dir; join = true)))
+        for f in files
+            lines = split(read(f, String), '\n'; keepempty = false)
+            A = eval(Meta.parse(strip(lines[1])))
+            b = eval(Meta.parse(strip(lines[2])))
+            all(isfinite, b) || continue
+            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            x_sparse = csr_qr(Acsr; ordering = :amd) \ b
+            Fd = csr_qr(Acsr; ordering = :amd, adaptive_dense = true)
+            x_dense = Fd \ b
+            @test Fd.k_dense > 0           # confirm the dense fallback fired
+            # The dense-tail residual must match the sparse path. Use the same
+            # absolute criterion as the bundled-matrix test: on full-rank inputs
+            # both residuals are ~machine-eps (their *relative* gap is FP noise),
+            # so compare against an ‖b‖-scaled tolerance, not a relative one.
+            r_sparse = norm(A * x_sparse - b)
+            scale = max(r_sparse, 1.0e-12 * norm(b))
+            @test norm(A * x_dense - b) <= 1.0e-8 + 2 * scale
+            # ldiv! on the dense-tail factorization is also allocation-free.
+            xd = zeros(length(x_dense))
+            ldiv!(xd, Fd, b)
+            ldiv!(xd, Fd, b)
+            @test (@allocated ldiv!(xd, Fd, b)) == 0
+        end
+    end
+
     @testset "Workspace pool: csr_refactor! mutates F in place" begin
         # The mutation-in-place semantic of csr_refactor! means the returned
         # factorization is === to the input one and the input's V/R buffers
