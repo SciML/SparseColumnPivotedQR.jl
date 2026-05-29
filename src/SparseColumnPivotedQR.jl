@@ -67,7 +67,11 @@ end
 # composite `ForwardDiff.Dual`) anyway, and there the `a*b + c*d` paired form
 # only materializes extra temporaries — measured a mild regression (~+4% on
 # BigFloat, ~+10% on `Dual{,2}` at the kernel level). So those (and complex)
-# take the plain `@simd` + `conj` path. `ivdep` is never used.
+# take the generic `@inbounds` + `conj` path. That path also omits `@simd`:
+# the apply is an indexed gather/scatter (`x[Vi[vp]]`) that doesn't vectorize
+# for these eltypes, so `@simd` only adds the reduction-split overhead —
+# measured slower (`Dual` +18–26%, `ComplexF64` +5%; no-op on `BigFloat`).
+# `ivdep` is never used.
 
 # Gather: tau = Σ conj(Vx[vp]) * x[Vi[vp]] over vp in vc1:vc2.
 @inline function _hh_gather(
@@ -91,8 +95,13 @@ end
         Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
         vc1::Int, vc2::Int
     ) where {T}
+    # No `@simd` on the generic path. The gather is an indexed reduction
+    # (`x[Vi[vp]]` through scattered row indices) that does not vectorize, so
+    # `@simd`'s only effect is the reduction-split, which is pure overhead for
+    # the non-hardware eltypes that reach here — measured SLOWER: ForwardDiff
+    # `Dual` +18–26%, `ComplexF64` +5%, and a no-op for `BigFloat`.
     tau = zero(T)
-    @inbounds @simd for vp in vc1:vc2
+    @inbounds for vp in vc1:vc2
         tau += conj(Vx[vp]) * x[Vi[vp]]
     end
     return tau
@@ -120,7 +129,9 @@ end
         Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
         vc1::Int, vc2::Int, scale::T
     ) where {T}
-    @inbounds @simd for vp in vc1:vc2
+    # `@inbounds`, no `@simd` (same rationale as the gather: scattered indexed
+    # writes don't vectorize for these eltypes; `@simd` is neutral-to-harmful).
+    @inbounds for vp in vc1:vc2
         x[Vi[vp]] -= scale * Vx[vp]
     end
     return nothing
