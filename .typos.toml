@@ -11,6 +11,7 @@ etree = "etree"         # elimination tree
 ereach = "ereach"       # row-reach in elimination tree
 ldiv = "ldiv"
 norm2 = "norm2"
+thr = "thr"             # threshold abbreviation used in identifiers (thr2, thr_drop2)
 hh = "hh"
 postord = "postord"
 postorder = "postorder"
