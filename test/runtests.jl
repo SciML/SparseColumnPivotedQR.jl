@@ -1,20 +1,15 @@
 using Test
 using LinearAlgebra
 using SparseArrays
-using SparseMatricesCSR
 using Random
 using SparseColumnPivotedQR
 using AMD  # trigger AMD extension
 using ForwardDiff
 
-# helper: convert CSC -> CSR
-to_csr(A::SparseMatrixCSC) = SparseMatrixCSR(transpose(sparse(transpose(A))))
-
-# Slightly nicer helper: build a CSR from a Julia matrix
-function build_csr(A::AbstractMatrix{T}) where {T}
-    Acsc = sparse(A)
-    return SparseMatrixCSR(transpose(sparse(transpose(Acsc))))
-end
+# The native API is `SparseMatrixCSC`; these helpers just normalize an input to
+# a CSC matrix.
+to_csr(A::SparseMatrixCSC) = A
+build_csr(A::AbstractMatrix) = sparse(A)
 
 # Steady-state allocation of one `csr_refactor!(adaptive_dense=true)` and one
 # `ldiv!`, measured inside a function barrier so the `@allocated` is not
@@ -285,7 +280,7 @@ end
             lines = split(text, '\n'; keepempty = false)
             A = eval(Meta.parse(strip(lines[1])))
             b = eval(Meta.parse(strip(lines[2])))
-            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            Acsr = sparse(A)
             F = csr_qr(Acsr)
             Fspqr = qr(A)
             xspqr = Fspqr \ b
@@ -457,7 +452,7 @@ end
             text = read(f, String)
             lines = split(text, '\n'; keepempty = false)
             A = eval(Meta.parse(strip(lines[1])))
-            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            Acsr = sparse(A)
             sym_default = csr_analyze(Acsr)
             sym_amd = csr_analyze(Acsr; ordering = :amd)
             # :default == :amd here.
@@ -545,7 +540,7 @@ end
             lines = split(text, '\n'; keepempty = false)
             A = eval(Meta.parse(strip(lines[1])))
             b = eval(Meta.parse(strip(lines[2])))
-            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            Acsr = sparse(A)
             sym_adapt = csr_analyze(Acsr; ordering = :adaptive)
             @test sym_adapt.ordering === :amd
             F = csr_factor(Acsr, sym_adapt)
@@ -609,9 +604,7 @@ end
 
         # The zero-allocation contract is on the native `SparseMatrixCSC` path:
         # its `colptr`/`rowval`/`nzval` are read straight into the pooled
-        # workspace with no transpose or intermediate allocation. (The CSR
-        # extension necessarily allocates one `SparseMatrixCSC` per call to
-        # convert, so it is not — and is not expected to be — zero-alloc.)
+        # workspace with no transpose or intermediate allocation.
         F = csr_qr(A1; ordering = :amd)
         # Warm up.
         csr_refactor!(F, A2)
@@ -660,7 +653,7 @@ end
             A = eval(Meta.parse(strip(lines[1])))
             b = eval(Meta.parse(strip(lines[2])))
             all(isfinite, b) || continue
-            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            Acsr = sparse(A)
             x_sparse = csr_qr(Acsr; ordering = :amd) \ b
             Fd = csr_qr(Acsr; ordering = :amd, adaptive_dense = true)
             x_dense = Fd \ b
@@ -915,7 +908,7 @@ end
                 lines = split(text, '\n'; keepempty = false)
                 A = eval(Meta.parse(strip(lines[1])))
                 b = eval(Meta.parse(strip(lines[2])))
-                Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+                Acsr = sparse(A)
                 F = csr_qr(Acsr; adaptive_dense = true)
                 Fspqr = qr(A)
                 xspqr = Fspqr \ b
@@ -1048,19 +1041,6 @@ end
 
 end
 
-# The CSC-native core must work with the `SparseMatricesCSR` extension absent.
-# This process has `using SparseMatricesCSR` loaded (so the extension is
-# active), so run the CSC-only checks in a fresh subprocess that never loads
-# `SparseMatricesCSR`.
-@testset "CSC-native core in a SparseMatricesCSR-free process" begin
-    code = """
-    push!(LOAD_PATH, "@")
-    include($(repr(joinpath(@__DIR__, "csc_core.jl"))))
-    """
-    p = run(
-        ignorestatus(
-            `$(Base.julia_cmd()) --project=$(Base.active_project()) -e $code`
-        ),
-    )
-    @test p.exitcode == 0
-end
+# Dedicated CSC-native core checks (the `SparseMatrixCSC` API is the native,
+# allocation-free path).
+include(joinpath(@__DIR__, "csc_core.jl"))

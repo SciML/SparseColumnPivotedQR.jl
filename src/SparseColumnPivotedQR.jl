@@ -899,10 +899,9 @@ factorization. Computes the column permutation `q`, row permutation `pinv`,
 column elimination tree, per-row `leftmost`, and the upper-bound sizes of
 the V (Householder) and R buffers.
 
-The native input is a `SparseMatrixCSC` (the SparseArrays stdlib format); its
+The input is a `SparseMatrixCSC` (the SparseArrays stdlib format); its
 `colptr`/`rowval`/`nzval` are read directly with no transpose or intermediate
-allocation. A `SparseMatrixCSR` (from `SparseMatricesCSR.jl`) is also accepted
-when that package is loaded, via an extension that converts to CSC.
+allocation.
 
 `ordering` selects the column ordering:
   * `:default`  — `:amd` if the AMD.jl extension is loaded (`using AMD`),
@@ -2424,9 +2423,7 @@ end
 # for the four standard BLAS element types, on tiny well-conditioned and
 # rank-deficient `SparseMatrixCSC` inputs (the native API), so the specialized
 # methods land in the package image. Only the `:natural` ordering is exercised:
-# `:amd` lives in a weak-dep extension and cannot be loaded from here. The
-# `SparseMatrixCSR` overloads live in their own extension, which carries its
-# own workload.
+# `:amd` lives in a weak-dep extension and cannot be loaded from here.
 
 @setup_workload begin
     @compile_workload begin
