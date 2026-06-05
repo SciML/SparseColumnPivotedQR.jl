@@ -5,7 +5,7 @@ using SparseArrays
 using SparseArrays: getcolptr
 using PrecompileTools
 
-import LinearAlgebra: ldiv!, rank
+import LinearAlgebra: ldiv!, rank, Adjoint, Transpose
 import Base: \, size, eltype
 
 export csr_qr, csr_analyze, csr_factor, csr_refactor!,
@@ -2413,6 +2413,150 @@ function Base.:\(F::CSRQRFactorization{T}, b::AbstractVector) where {T}
     x = zeros(T, F.n)
     ldiv!(x, F, bb)
     return x
+end
+
+# ---------------------------------------------------------------------------
+# Adjoint / transpose solve path.
+# ---------------------------------------------------------------------------
+#
+# The factorization is S = P A Qcol = Q R (S is m2 x n; R upper triangular,
+# stored CSC; the row permutation is `pinv`, the effective column permutation
+# `q_eff`). Equivalently A = Pᵀ Q R̃ Qcolᵀ with R̃ = [R; 0] (m2 x n), so
+#
+#     Aᴴ = Qcol R̃ᴴ Qᴴ P,    R̃ᴴ = [Rᴴ | 0]  (n x m2).
+#
+# To solve Aᴴ x = b (x length m, b length n):
+#   1) z₁ = Qcolᵀ b              i.e. z₁[k] = b[q_eff[k]]            (length n)
+#   2) Rᴴ z₂ = z₁                lower-triangular forward solve      (length n)
+#   3) work[1:n] = z₂; work[n+1:m2] = 0; work := Q work             (apply Q)
+#   4) x[i] = work[pinv[i]]      (i.e. Pᵀ; drop fictitious rows > m)
+#
+# Step 3 reuses `_apply_Q!` directly (it already composes the sparse and dense
+# tails in the correct order). Only the Rᴴ (lower-triangular) solve is new.
+#
+# Rank-deficient / rectangular handling mirrors the primal `_usolve!`: rows of
+# the forward solve whose diagonal magnitude is at/below `F.tol` are pinned to
+# zero, giving the consistent minimum-norm / least-squares branch. Because the
+# rank-deficient factor places every zero pivot in the trailing positions
+# (k > rnk) of R, the forward solve over leading positions is exact.
+
+Base.adjoint(F::CSRQRFactorization) = Adjoint(F)
+Base.transpose(F::CSRQRFactorization) = Transpose(F)
+
+# Solve Rᴴ z = c, where R is the n x n upper-triangular CSC factor; Rᴴ is
+# lower triangular. Forward substitution: row k of Rᴴ equals conj of column k
+# of R (R[i,k] for i <= k). Rank-revealing: z[k] = 0 when |R[k,k]| <= tol.
+function _usolve_adjoint!(
+        z::AbstractVector{T}, F::CSRQRFactorization{T},
+        c::AbstractVector{T}
+    ) where {T}
+    n = F.n
+    Rp = F.R_colptr; Ri = F.R_rowval; Rx = F.R_nzval
+    tol_use = F.tol
+    @inbounds for k in 1:n
+        rc1 = Rp[k]; rc2 = Rp[k + 1] - 1
+        # Identify the diagonal slot and accumulate the strictly-lower (in Rᴴ)
+        # contribution sum_{i<k} conj(R[i,k]) z[i]. The emit places the diagonal
+        # at the last slot for sparse columns; the dense tail may be out of
+        # order, so search generally.
+        diag_p = 0
+        acc = c[k]
+        for p in rc1:rc2
+            i = Ri[p]
+            if i == k
+                diag_p = p
+            elseif i < k
+                acc -= conj(Rx[p]) * z[i]
+            end
+        end
+        if diag_p == 0
+            z[k] = zero(T)
+            continue
+        end
+        d = Rx[diag_p]
+        if abs(d) <= tol_use || d == 0
+            z[k] = zero(T)
+            continue
+        end
+        z[k] = acc / conj(d)
+    end
+    return z
+end
+
+function _ldiv_adjoint!(
+        x::AbstractVector{T}, F::CSRQRFactorization{T},
+        b::AbstractVector{T}
+    ) where {T}
+    length(b) == F.n ||
+        throw(DimensionMismatch("b length $(length(b)) != n=$(F.n) for adjoint solve"))
+    length(x) == F.m ||
+        throw(DimensionMismatch("x length $(length(x)) != m=$(F.m) for adjoint solve"))
+    m, n, m2 = F.m, F.n, F.sym.m2
+    pinv = F.sym.pinv
+    q = F.q_eff
+
+    ws = F.sym.workspace
+    local work::Vector{T}
+    local z::Vector{T}
+    if ws isa _CSRQRWorkspace{T, real(T)} &&
+            length(ws.solve_work) >= m2 && length(ws.solve_xprime) >= n
+        work = ws.solve_work
+        z = ws.solve_xprime
+    else
+        work = Vector{T}(undef, m2)
+        z = Vector{T}(undef, n)
+    end
+
+    # 1) z₁ = Qcolᵀ b.
+    @inbounds for k in 1:n
+        z[k] = b[q[k]]
+    end
+    # 2) Rᴴ z₂ = z₁ (forward solve, in place on z).
+    _usolve_adjoint!(z, F, z)
+    # 3) work = Q [z₂; 0].
+    @inbounds for k in 1:n
+        work[k] = z[k]
+    end
+    @inbounds for i in (n + 1):m2
+        work[i] = zero(T)
+    end
+    _apply_Q!(F, work)
+    # 4) x = Pᵀ work (drop fictitious rows > m).
+    @inbounds for i in 1:m
+        x[i] = work[pinv[i]]
+    end
+    return x
+end
+
+function LinearAlgebra.ldiv!(
+        x::AbstractVector{T}, aF::Adjoint{T, <:CSRQRFactorization{T}},
+        b::AbstractVector{T}
+    ) where {T}
+    return _ldiv_adjoint!(x, parent(aF), b)
+end
+
+function LinearAlgebra.ldiv!(
+        x::AbstractVector{T}, tF::Transpose{T, <:CSRQRFactorization{T}},
+        b::AbstractVector{T}
+    ) where {T <: Real}
+    return _ldiv_adjoint!(x, parent(tF), b)
+end
+
+function Base.:\(aF::Adjoint{T, <:CSRQRFactorization{T}}, b::AbstractVector{T}) where {T}
+    x = zeros(T, parent(aF).m)
+    return _ldiv_adjoint!(x, parent(aF), b)
+end
+
+function Base.:\(aF::Adjoint{T, <:CSRQRFactorization{T}}, b::AbstractVector) where {T}
+    bb = convert(Vector{T}, b)
+    x = zeros(T, parent(aF).m)
+    return _ldiv_adjoint!(x, parent(aF), bb)
+end
+
+function Base.:\(tF::Transpose{T, <:CSRQRFactorization{T}}, b::AbstractVector) where {T <: Real}
+    bb = convert(Vector{T}, b)
+    x = zeros(T, parent(tF).m)
+    return _ldiv_adjoint!(x, parent(tF), bb)
 end
 
 # ---------------------------------------------------------------------------

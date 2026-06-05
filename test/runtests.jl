@@ -1039,6 +1039,102 @@ end
         end
     end
 
+    @testset "adjoint / transpose solve" begin
+        Random.seed!(12345)
+
+        # Square full-rank and tall (overdetermined primal): here the primal `\`
+        # coincides with the LAPACK pseudoinverse solve, so the adjoint solve
+        # must equal `Matrix(A)' \ b` to a tight tolerance.
+        for T in (Float64, ComplexF64)
+            for (m, n) in ((8, 8), (12, 6))
+                Adense = Matrix(sprand(T, m, n, 0.5))
+                Adense[1, 1] += one(T)
+                for i in 1:min(m, n)
+                    Adense[i, i] += 3one(T)
+                end
+                A = build_csr(Adense)
+                F = csr_qr(A; ordering = :natural)
+                M = Matrix(Adense)
+                b = rand(T, n)                       # Aᴴ is n x m, length-n rhs
+                x = adjoint(F) \ b
+                xref = M' \ b
+                @test x ≈ xref atol = 1.0e-9 rtol = 1.0e-9
+                x2 = zeros(T, m)
+                ldiv!(x2, adjoint(F), copy(b))
+                @test x2 ≈ xref atol = 1.0e-9 rtol = 1.0e-9
+                if T <: Real
+                    xt = transpose(F) \ b
+                    @test xt ≈ transpose(M) \ b atol = 1.0e-9 rtol = 1.0e-9
+                    xt2 = zeros(T, m)
+                    ldiv!(xt2, transpose(F), copy(b))
+                    @test xt2 ≈ transpose(M) \ b atol = 1.0e-9 rtol = 1.0e-9
+                end
+            end
+        end
+
+        # Adjoint-operator identity <G b, c> == <b, H c> for G = primal solve and
+        # H = adjoint solve, for all shapes (square / over- / under-determined).
+        # This is the rigorous correctness criterion: the adjoint solve is by
+        # construction the exact adjoint of the primal solve operator, including
+        # for the underdetermined (wide) case where the primal returns the basic
+        # least-squares solution rather than the minimum-norm one.
+        for T in (Float64, ComplexF64)
+            for (m, n) in ((8, 8), (12, 6), (6, 12))
+                Adense = Matrix(sprand(T, m, n, 0.5))
+                Adense[1, 1] += one(T)
+                for i in 1:min(m, n)
+                    Adense[i, i] += 3one(T)
+                end
+                A = build_csr(Adense)
+                F = csr_qr(A; ordering = :natural)
+                b = rand(T, m)
+                c = rand(T, n)
+                Gb = F \ b
+                Hc = adjoint(F) \ c
+                @test dot(Gb, c) ≈ dot(b, Hc) atol = 1.0e-12 rtol = 1.0e-12
+            end
+        end
+
+        # Rank-deficient square: the adjoint solve must be the exact adjoint of
+        # the primal (basic least-squares) solve operator, validated over several
+        # random right-hand sides.
+        for T in (Float64, ComplexF64)
+            Adense = Matrix(sprand(T, 10, 10, 0.4))
+            for i in 1:10
+                Adense[i, i] += 2one(T)
+            end
+            Adense[:, 10] .= Adense[:, 3] .+ Adense[:, 4]     # rank 9
+            A = build_csr(Adense)
+            F = csr_qr(A; ordering = :natural)
+            @test rank(F) == 9
+            b = rand(T, 10)
+            x = adjoint(F) \ b
+            for _ in 1:8
+                bb = rand(T, 10)
+                @test dot(F \ bb, b) ≈ dot(bb, x) atol = 1.0e-10 rtol = 1.0e-10
+            end
+            x2 = zeros(T, 10)
+            ldiv!(x2, adjoint(F), copy(b))
+            @test x2 ≈ x atol = 1.0e-12 rtol = 1.0e-12
+        end
+
+        # Adaptive-dense fallback (k_dense > 0): the adjoint solve must reuse the
+        # dense Householder tail correctly.
+        for T in (Float64, ComplexF64)
+            Adense = Matrix(sprand(T, 30, 30, 0.8))
+            for i in 1:30
+                Adense[i, i] += 4one(T)
+            end
+            A = build_csr(Adense)
+            F = csr_qr(A; ordering = :natural, adaptive_dense = true, dense_threshold = 0.1)
+            @test F.k_dense > 0
+            M = Matrix(Adense)
+            b = rand(T, 30)
+            x = adjoint(F) \ b
+            @test x ≈ M' \ b atol = 1.0e-9 rtol = 1.0e-9
+        end
+    end
+
 end
 
 # Dedicated CSC-native core checks (the `SparseMatrixCSC` API is the native,
