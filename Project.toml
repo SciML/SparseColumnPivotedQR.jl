@@ -1,19 +1,20 @@
 name = "SparseColumnPivotedQR"
 uuid = "a57abbd0-fea5-4d57-96be-5e525945e8e4"
 authors = ["Chris Rackauckas <accounts@chrisrackauckas.com> and contributors"]
-version = "0.1.0"
+version = "0.2.0"
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 PrecompileTools = "aea7be01-6a6a-4083-8856-8a6e6704d82a"
 SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
-SparseMatricesCSR = "a0a7dd2c-ebf4-11e9-1f05-cf50bc540ca1"
 
 [weakdeps]
 AMD = "14f7f29c-3bd6-536c-9a0b-7339e30b5a3e"
+SparseMatricesCSR = "a0a7dd2c-ebf4-11e9-1f05-cf50bc540ca1"
 
 [extensions]
 SparseColumnPivotedQRAMDExt = "AMD"
+SparseColumnPivotedQRSparseMatricesCSRExt = "SparseMatricesCSR"
 
 [compat]
 AMD = "0.5"
@@ -27,7 +28,8 @@ julia = "1.10"
 AMD = "14f7f29c-3bd6-536c-9a0b-7339e30b5a3e"
 ForwardDiff = "f6369f11-7733-5829-9624-2563aa707210"
 Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+SparseMatricesCSR = "a0a7dd2c-ebf4-11e9-1f05-cf50bc540ca1"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["AMD", "ForwardDiff", "Random", "Test"]
+test = ["AMD", "ForwardDiff", "Random", "SparseMatricesCSR", "Test"]
