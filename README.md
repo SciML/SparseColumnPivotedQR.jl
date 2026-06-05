@@ -11,7 +11,7 @@
 
 A pure-Julia, rank-revealing, column-pivoted Householder QR factorization that
 operates directly on
-[`SparseMatrixCSR`](https://github.com/JuliaSmoothOptimizers/SparseMatricesCSR.jl)
+[`SparseMatrixCSC`](https://docs.julialang.org/en/v1/stdlib/SparseArrays/)
 sparse matrices. Targets the same "small-to-medium sparse" niche as KLU does for LU
 — low symbolic-phase overhead, no BLAS-3 / multifrontal machinery — while preserving
 the rank-revealing guarantees of LAPACK's column-pivoted QR.
@@ -29,13 +29,13 @@ version of the documentation, which contains the unreleased features.
 using Pkg
 Pkg.add("SparseColumnPivotedQR")
 
-using SparseArrays, SparseMatricesCSR, SparseColumnPivotedQR
+using SparseArrays, SparseColumnPivotedQR
 
-A = SparseMatrixCSR(sparse([1.0  0   2   0   0;
-                            0    3   0   0   1;
-                            4    0   5   0   0;
-                            0    0   0   6   0;
-                            0    7   0   0   8]))
+A = sparse([1.0  0   2   0   0;
+            0    3   0   0   1;
+            4    0   5   0   0;
+            0    0   0   6   0;
+            0    7   0   0   8])
 b = [1.0, 2.0, 3.0, 4.0, 5.0]
 
 F = csr_qr(A)

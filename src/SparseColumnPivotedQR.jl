@@ -2,7 +2,7 @@ module SparseColumnPivotedQR
 
 using LinearAlgebra
 using SparseArrays
-using SparseMatricesCSR
+using SparseArrays: getcolptr
 using PrecompileTools
 
 import LinearAlgebra: ldiv!, rank
@@ -11,11 +11,6 @@ import Base: \, size, eltype
 export csr_qr, csr_analyze, csr_factor, csr_refactor!,
     has_amd_extension,
     CSRQRSymbolic, CSRQRFactorization
-
-# CSR offset: rowptr stores 1-based if Bi == 1, 0-based if Bi == 0.
-@inline function getoffset(::SparseMatrixCSR{Bi}) where {Bi}
-    return Bi == 1 ? 0 : 1
-end
 
 # The adaptive-dense fallback finishes the trailing dense block with LAPACK
 # `geqp3!` / `ormqr!`, which are only defined for the four BLAS float types
@@ -415,8 +410,14 @@ mutable struct CSRQRSymbolic
     rnz::Int
     rcount::Vector{Int}     # exact nnz per column of R (length n)
     ordering::Symbol
+    # CSR pattern of the input (internal layout, 1-based) used by the symbolic
+    # builders and the deferral/repivot `_rebuild_symbolic_for_q` path.
     pattern_rowptr::Vector{Int}
     pattern_colval::Vector{Int}
+    # Native CSC pattern snapshot (colptr, rowval) of the input, used by
+    # `_pattern_matches` for the zero-allocation fixed-pattern refactor check.
+    pattern_colptr::Vector{Int}
+    pattern_rowval::Vector{Int}
     # Lazily-attached numeric workspace. Type-erased here because Symbolic
     # is built without knowing the value-element type T.
     workspace::Union{Nothing, _CSRQRWorkspace}
@@ -473,30 +474,67 @@ Base.eltype(::CSRQRFactorization{T}) where {T} = T
 # CSR <-> CSC conversion (pattern + values)
 # ---------------------------------------------------------------------------
 
-function _capture_pattern(A::SparseMatrixCSR{Bi}) where {Bi}
-    off = getoffset(A)
-    rowptr = Vector{Int}(undef, length(A.rowptr))
-    @inbounds for i in eachindex(A.rowptr)
-        rowptr[i] = Int(A.rowptr[i]) + off
+# Transpose a CSC pattern (colptr, rowval) into the CSR pattern (rowptr, colval)
+# the symbolic machinery operates on. Pattern-only (integer) counting-sort
+# transpose — no values touched. `colval` lists, within each row, the columns
+# in ascending order (a stable byproduct of the column-major scan).
+function _csc_pattern_to_csr(colptr::Vector{Int}, rowval::Vector{Int}, m::Int, n::Int)
+    nnz_total = length(rowval)
+    rowptr = Vector{Int}(undef, m + 1)
+    rowcounts = zeros(Int, m)
+    @inbounds for p in 1:nnz_total
+        rowcounts[rowval[p]] += 1
     end
-    colval = Vector{Int}(undef, length(A.colval))
-    @inbounds for i in eachindex(A.colval)
-        colval[i] = Int(A.colval[i]) + off
+    rowptr[1] = 1
+    @inbounds for i in 1:m
+        rowptr[i + 1] = rowptr[i] + rowcounts[i]
+    end
+    colval = Vector{Int}(undef, nnz_total)
+    work = Vector{Int}(undef, m)
+    @inbounds for i in 1:m
+        work[i] = rowptr[i]
+    end
+    @inbounds for j in 1:n
+        c1 = colptr[j]; c2 = colptr[j + 1] - 1
+        for p in c1:c2
+            i = rowval[p]
+            colval[work[i]] = j
+            work[i] += 1
+        end
     end
     return rowptr, colval
 end
 
-function _pattern_matches(S::CSRQRSymbolic, A::SparseMatrixCSR{Bi}) where {Bi}
+# Snapshot a `SparseMatrixCSC`'s structural pattern for the symbolic. Returns
+# the CSR pattern (rowptr, colval) used by the symbolic builders and the
+# rebuild path, plus a copy of the native CSC pattern (colptr, rowval) used by
+# `_pattern_matches` for the zero-allocation refactor fast path.
+function _capture_pattern(A::SparseMatrixCSC)
+    m, n = size(A)
+    # Normalize to `Vector{Int}`: the symbolic machinery is `Int`-indexed, and
+    # a CSC built from `Int32` arrays would otherwise carry a narrower index
+    # type through the captured pattern.
+    colptr = convert(Vector{Int}, getcolptr(A))
+    rowval = convert(Vector{Int}, rowvals(A))
+    rowptr, colval = _csc_pattern_to_csr(colptr, rowval, m, n)
+    return rowptr, colval, colptr, rowval
+end
+
+# Fast structural-pattern comparison against the CSC snapshot held on the
+# symbolic. Compares `colptr`/`rowval` directly so the common fixed-pattern
+# `csr_refactor!` is a cheap O(nnz) integer scan with no allocation.
+function _pattern_matches(S::CSRQRSymbolic, A::SparseMatrixCSC)
     m, n = size(A)
     (m == S.m && n == S.n) || return false
-    length(A.rowptr) == length(S.pattern_rowptr) || return false
-    length(A.colval) == length(S.pattern_colval) || return false
-    off = getoffset(A)
-    @inbounds for i in eachindex(A.rowptr)
-        Int(A.rowptr[i]) + off == S.pattern_rowptr[i] || return false
+    colptr = getcolptr(A)
+    rowval = rowvals(A)
+    length(colptr) == length(S.pattern_colptr) || return false
+    length(rowval) == length(S.pattern_rowval) || return false
+    @inbounds for i in eachindex(colptr)
+        colptr[i] == S.pattern_colptr[i] || return false
     end
-    @inbounds for i in eachindex(A.colval)
-        Int(A.colval[i]) + off == S.pattern_colval[i] || return false
+    @inbounds for p in eachindex(rowval)
+        rowval[p] == S.pattern_rowval[p] || return false
     end
     return true
 end
@@ -854,12 +892,16 @@ end
 # ---------------------------------------------------------------------------
 
 """
-    csr_analyze(A::SparseMatrixCSR; ordering=:default) -> CSRQRSymbolic
+    csr_analyze(A::SparseMatrixCSC; ordering=:default) -> CSRQRSymbolic
 
 Symbolic analysis phase for the sparse column-pivoted Householder QR
 factorization. Computes the column permutation `q`, row permutation `pinv`,
 column elimination tree, per-row `leftmost`, and the upper-bound sizes of
 the V (Householder) and R buffers.
+
+The input is a `SparseMatrixCSC` (the SparseArrays stdlib format); its
+`colptr`/`rowval`/`nzval` are read directly with no transpose or intermediate
+allocation.
 
 `ordering` selects the column ordering:
   * `:default`  — `:amd` if the AMD.jl extension is loaded (`using AMD`),
@@ -878,9 +920,9 @@ the V (Householder) and R buffers.
 Returns a `CSRQRSymbolic` that can be passed to `csr_factor` and reused via
 `csr_refactor!` for matrices with identical sparsity patterns.
 """
-function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol = :default) where {Bi}
+function csr_analyze(A::SparseMatrixCSC; ordering::Symbol = :default)
     m, n = size(A)
-    rowptr, colval = _capture_pattern(A)
+    rowptr, colval, colptr_snap, rowval_snap = _capture_pattern(A)
     ordering_use = _resolve_ordering(ordering)
     if (
             ordering_use === :amd || ordering_use === :colamd ||
@@ -910,13 +952,13 @@ function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol = :default) where 
             return CSRQRSymbolic(
                 m, n, m2_a, q_a, pinv_a, parent_a,
                 leftmost_a, vnz_a, rnz_a, rcount_a, :amd,
-                rowptr, colval, nothing
+                rowptr, colval, colptr_snap, rowval_snap, nothing
             )
         else
             return CSRQRSymbolic(
                 m, n, m2_n, q_n, pinv_n, parent_n,
                 leftmost_n, vnz_n, rnz_n, rcount_n, :natural,
-                rowptr, colval, nothing
+                rowptr, colval, colptr_snap, rowval_snap, nothing
             )
         end
     end
@@ -925,12 +967,13 @@ function csr_analyze(A::SparseMatrixCSR{Bi}; ordering::Symbol = :default) where 
         _build_symbolic(rowptr, colval, m, n, ordering_use)
     return CSRQRSymbolic(
         m, n, m2, q, pinv, parent, leftmost_perm,
-        vnz, rnz, rcount, ordering_use, rowptr, colval, nothing
+        vnz, rnz, rcount, ordering_use, rowptr, colval,
+        colptr_snap, rowval_snap, nothing
     )
 end
 
 """
-    csr_factor(A::SparseMatrixCSR, sym::CSRQRSymbolic; tol=nothing, drop_tol=0,
+    csr_factor(A::SparseMatrixCSC, sym::CSRQRSymbolic; tol=nothing, drop_tol=0,
                adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
 
 Numeric factorization given a `CSRQRSymbolic`. Implements the Davis
@@ -959,12 +1002,12 @@ and finishes with LAPACK `geqp3!`. The composed column permutation is
 stored in `F.q_eff`.
 """
 function csr_factor(
-        A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic;
+        A::SparseMatrixCSC{T}, sym::CSRQRSymbolic;
         tol::Union{Nothing, Real} = nothing,
         drop_tol::Real = 0,
         adaptive_dense::Bool = false,
         dense_threshold::Real = 0.4
-    ) where {Bi, T}
+    ) where {T}
     return _factor_kernel(
         A, sym, tol, nothing, real(T)(drop_tol),
         adaptive_dense, real(T)(dense_threshold)
@@ -972,7 +1015,7 @@ function csr_factor(
 end
 
 """
-    csr_qr(A::SparseMatrixCSR; tol=nothing, ordering=:default, drop_tol=0,
+    csr_qr(A::SparseMatrixCSC; tol=nothing, ordering=:default, drop_tol=0,
            adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
 
 One-shot convenience: equivalent to `csr_factor(A, csr_analyze(A; ordering); tol)`.
@@ -984,13 +1027,13 @@ typical dense-fill matrices that arise from nonlinear solver linsolves,
 for matrices whose columns are already well-ordered.
 """
 function csr_qr(
-        A::SparseMatrixCSR{Bi, T};
+        A::SparseMatrixCSC;
         tol::Union{Nothing, Real} = nothing,
         ordering::Symbol = :default,
         drop_tol::Real = 0,
         adaptive_dense::Bool = false,
         dense_threshold::Real = 0.4
-    ) where {Bi, T}
+    )
     sym = csr_analyze(A; ordering = ordering)
     return csr_factor(
         A, sym; tol = tol, drop_tol = drop_tol,
@@ -999,7 +1042,7 @@ function csr_qr(
 end
 
 """
-    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSR; tol=nothing, drop_tol=0,
+    csr_refactor!(F::CSRQRFactorization, A::SparseMatrixCSC; tol=nothing, drop_tol=0,
                   adaptive_dense=false, dense_threshold=0.4) -> CSRQRFactorization
 
 Numeric refactorization, mutating `F` in place. If the sparsity pattern of
@@ -1019,12 +1062,12 @@ same meaning as in [`csr_factor`](@ref).
 """
 function csr_refactor!(
         F::CSRQRFactorization{T},
-        A::SparseMatrixCSR{Bi};
+        A::SparseMatrixCSC;
         tol::Union{Nothing, Real} = nothing,
         drop_tol::Real = 0,
         adaptive_dense::Bool = false,
         dense_threshold::Real = 0.4
-    ) where {T, Bi}
+    ) where {T}
     dt = real(T)(drop_tol)
     dth = real(T)(dense_threshold)
     if _pattern_matches(F.sym, A)
@@ -1064,25 +1107,25 @@ end
 end
 
 function _factor_kernel(
-        A::SparseMatrixCSR{Bi, T}, sym::CSRQRSymbolic,
+        A::SparseMatrixCSC{T}, sym::CSRQRSymbolic,
         tol::Union{Nothing, Real},
         F::Union{Nothing, CSRQRFactorization},
         drop_tol::Real = zero(real(T)),
         adaptive_dense::Bool = false,
         dense_threshold::Real = real(T)(0.4)
-    ) where {Bi, T}
+    ) where {T}
     m, n = size(A)
     (m == sym.m && n == sym.n) ||
         throw(DimensionMismatch("A is $m x $n but symbolic is $(sym.m) x $(sym.n)"))
 
     RT = real(T)
-    nnz_A = length(A.colval)
+    nnz_A = length(rowvals(A))
     ws = _get_workspace(T, sym, nnz_A)::_CSRQRWorkspace{T, RT}
 
-    # Single-pass CSR -> CSC(A) conversion + Frobenius norm + column-norm
-    # cache (the column norms feed the zero-column check below). All buffers
-    # come from the workspace.
-    fro2 = _csr_to_csc_with_norms!(ws, A)
+    # Copy A's CSC arrays into the workspace + compute the Frobenius norm and
+    # per-column squared norms (the column norms feed the zero-column check
+    # below). All buffers come from the workspace; no transpose needed.
+    fro2 = _csc_copy_with_norms!(ws, A)
     fro = sqrt(fro2)
     tol_use = tol === nothing ? RT(eps(RT) * max(m, n)) * fro : RT(max(tol, 0))
     tol2 = tol_use * tol_use
@@ -1229,7 +1272,8 @@ function _factor_kernel(
         sym_next = CSRQRSymbolic(
             sym_cur.m, sym_cur.n, m2n, qn, pinvn, parentn, leftmostn,
             vnzn, rnzn, rcountn, sym_cur.ordering, sym_cur.pattern_rowptr,
-            sym_cur.pattern_colval, sym_cur.workspace
+            sym_cur.pattern_colval, sym_cur.pattern_colptr,
+            sym_cur.pattern_rowval, sym_cur.workspace
         )
         ws_next = _get_workspace(T, sym_next, nnz_A)::_CSRQRWorkspace{T, RT}
         _permute_pq!(ws_next, sym_next.pinv, sym_next.q, m, n)
@@ -1288,61 +1332,41 @@ function _factor_kernel(
     return F_out
 end
 
-# In-place CSR -> CSC of A, plus per-column squared norms and ||A||_F^2.
-# Writes into ws.colptr_A, ws.rowval_A, ws.nzval_A, ws.col_nrm2. Returns
-# the Frobenius-norm-squared. ws.work_perm doubles as a temporary copy of
-# colptr used during scatter.
-function _csr_to_csc_with_norms!(
+# Copy A's CSC arrays into the workspace, plus per-column squared norms and
+# ||A||_F^2. Writes into ws.colptr_A, ws.rowval_A, ws.nzval_A, ws.col_nrm2.
+# Returns the Frobenius-norm-squared. The input is already CSC, so this is a
+# straight copy with the column norms read directly off `nzval` per column —
+# no transpose, no scatter.
+function _csc_copy_with_norms!(
         ws::_CSRQRWorkspace{T, RT},
-        A::SparseMatrixCSR{Bi, T}
-    ) where {Bi, T, RT}
+        A::SparseMatrixCSC{T}
+    ) where {T, RT}
     m, n = size(A)
-    off = getoffset(A)
-    rowptr = A.rowptr
-    colval = A.colval
-    nzval_in = A.nzval
-    nnz_total = length(colval)
+    colptr_in = getcolptr(A)
+    rowval_in = rowvals(A)
+    nzval_in = nonzeros(A)
 
     colptr = ws.colptr_A
     rowval = ws.rowval_A
     nzval = ws.nzval_A
     col_nrm2 = ws.col_nrm2
-    work = ws.work_perm
 
-    # Reset accumulators.
-    @inbounds for j in 1:n
-        col_nrm2[j] = zero(RT)
-    end
-    # Use colptr as a count buffer first (we'll convert in place).
-    @inbounds for j in 1:(n + 1)
-        colptr[j] = 0
-    end
-    @inbounds for p in 1:nnz_total
-        colptr[Int(colval[p]) + off + 1] += 1
-    end
-    # Cumsum: colptr[j+1] = colptr[j] + count[j].
-    colptr[1] = 1
-    @inbounds for j in 1:n
-        colptr[j + 1] += colptr[j]
-    end
-    @inbounds for j in 1:(n + 1)
-        work[j] = colptr[j]
-    end
     fro2 = zero(RT)
-    @inbounds for i in 1:m
-        r1 = rowptr[i] + off
-        r2 = rowptr[i + 1] + off - 1
-        for p in r1:r2
-            j = Int(colval[p]) + off
-            slot = work[j]
+    @inbounds for j in 1:(n + 1)
+        colptr[j] = colptr_in[j]
+    end
+    @inbounds for j in 1:n
+        c1 = colptr_in[j]; c2 = colptr_in[j + 1] - 1
+        cn = zero(RT)
+        for p in c1:c2
             v = nzval_in[p]
-            rowval[slot] = i
-            nzval[slot] = v
-            work[j] = slot + 1
+            rowval[p] = rowval_in[p]
+            nzval[p] = v
             v2 = abs2(v)
-            col_nrm2[j] += v2
-            fro2 += v2
+            cn += v2
         end
+        col_nrm2[j] = cn
+        fro2 += cn
     end
     return fro2
 end
@@ -1450,7 +1474,8 @@ function _maybe_repivot_zero_cols_from_norms(
     return CSRQRSymbolic(
         sym.m, sym.n, m2_2, q2, pinv2, parent2, leftmost2,
         vnz2, rnz2, rcount2, sym.ordering, sym.pattern_rowptr,
-        sym.pattern_colval, sym.workspace
+        sym.pattern_colval, sym.pattern_colptr, sym.pattern_rowval,
+        sym.workspace
     )
 end
 
@@ -2395,10 +2420,10 @@ end
 # ---------------------------------------------------------------------------
 #
 # Exercise the hot paths (analyze / factor / refactor / solve / rank / size)
-# for the four standard BLAS element types and both index types, on tiny
-# well-conditioned and rank-deficient inputs, so the specialized methods land
-# in the package image. Only the `:natural` ordering is exercised: `:amd`
-# lives in a weak-dep extension and cannot be loaded from here.
+# for the four standard BLAS element types, on tiny well-conditioned and
+# rank-deficient `SparseMatrixCSC` inputs (the native API), so the specialized
+# methods land in the package image. Only the `:natural` ordering is exercised:
+# `:amd` lives in a weak-dep extension and cannot be loaded from here.
 
 @setup_workload begin
     @compile_workload begin
@@ -2408,7 +2433,7 @@ end
                 rows = Ti[1, 2, 3, 4, 5, 6, 1, 2, 3, 4]
                 cols = Ti[1, 2, 3, 4, 5, 6, 2, 3, 4, 5]
                 vals = T[4, 4, 4, 4, 4, 4, 1, 1, 1, 1]
-                A = sparsecsr(rows, cols, vals, 6, 6)
+                A = sparse(rows, cols, vals, 6, 6)
                 b = ones(T, 6)
 
                 F = csr_qr(A; ordering = :natural)
@@ -2428,7 +2453,7 @@ end
                 drows = Ti[1, 2, 3, 4, 5, 1, 2, 3, 4, 6]
                 dcols = Ti[1, 2, 3, 4, 5, 2, 3, 4, 5, 1]
                 dvals = T[4, 4, 4, 4, 4, 1, 1, 1, 1, 4]
-                Ad = sparsecsr(drows, dcols, dvals, 6, 6)
+                Ad = sparse(drows, dcols, dvals, 6, 6)
                 Fd = csr_qr(Ad; ordering = :natural)
                 Fd \ b
                 rank(Fd)

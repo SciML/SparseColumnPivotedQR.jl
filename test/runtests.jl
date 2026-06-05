@@ -1,26 +1,21 @@
 using Test
 using LinearAlgebra
 using SparseArrays
-using SparseMatricesCSR
 using Random
 using SparseColumnPivotedQR
 using AMD  # trigger AMD extension
 using ForwardDiff
 
-# helper: convert CSC -> CSR
-to_csr(A::SparseMatrixCSC) = SparseMatrixCSR(transpose(sparse(transpose(A))))
-
-# Slightly nicer helper: build a CSR from a Julia matrix
-function build_csr(A::AbstractMatrix{T}) where {T}
-    Acsc = sparse(A)
-    return SparseMatrixCSR(transpose(sparse(transpose(Acsc))))
-end
+# The native API is `SparseMatrixCSC`; these helpers just normalize an input to
+# a CSC matrix.
+to_csr(A::SparseMatrixCSC) = A
+build_csr(A::AbstractMatrix) = sparse(A)
 
 # Steady-state allocation of one `csr_refactor!(adaptive_dense=true)` and one
 # `ldiv!`, measured inside a function barrier so the `@allocated` is not
 # perturbed by boxed captures in the calling (testset) scope.
-function _refactor_alloc(F, Acsr)
-    return @allocated csr_refactor!(F, Acsr; adaptive_dense = true)
+function _refactor_alloc(F, A)
+    return @allocated csr_refactor!(F, A; adaptive_dense = true)
 end
 function _ldiv_alloc(x, F, b)
     return @allocated ldiv!(x, F, b)
@@ -39,17 +34,17 @@ function _dense_zeroalloc_case(::Type{T}, A64, n) where {T}
         SparseMatrixCSC{T, Int},
         T <: Complex ? (T.(A64) .+ T(0.1im) .* (A64 .!= 0)) : T.(A64),
     )
-    Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+    # Native CSC path: the zero-alloc contract applies to `SparseMatrixCSC`.
     b = ones(T, size(A, 1))
     x = zeros(T, n)
-    sym = csr_analyze(Acsr; ordering = :amd)
-    F = csr_factor(Acsr, sym; adaptive_dense = true)
-    csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x, F, b)   # warm
-    csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x, F, b)
-    ra = _refactor_alloc(F, Acsr)
+    sym = csr_analyze(A; ordering = :amd)
+    F = csr_factor(A, sym; adaptive_dense = true)
+    csr_refactor!(F, A; adaptive_dense = true); ldiv!(x, F, b)   # warm
+    csr_refactor!(F, A; adaptive_dense = true); ldiv!(x, F, b)
+    ra = _refactor_alloc(F, A)
     la = _ldiv_alloc(x, F, b)
-    x1 = zeros(T, n); csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x1, F, b)
-    x2 = zeros(T, n); csr_refactor!(F, Acsr; adaptive_dense = true); ldiv!(x2, F, b)
+    x1 = zeros(T, n); csr_refactor!(F, A; adaptive_dense = true); ldiv!(x1, F, b)
+    x2 = zeros(T, n); csr_refactor!(F, A; adaptive_dense = true); ldiv!(x2, F, b)
     return F.k_dense, ra, la, x1 == x2
 end
 
@@ -285,7 +280,7 @@ end
             lines = split(text, '\n'; keepempty = false)
             A = eval(Meta.parse(strip(lines[1])))
             b = eval(Meta.parse(strip(lines[2])))
-            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            Acsr = sparse(A)
             F = csr_qr(Acsr)
             Fspqr = qr(A)
             xspqr = Fspqr \ b
@@ -457,7 +452,7 @@ end
             text = read(f, String)
             lines = split(text, '\n'; keepempty = false)
             A = eval(Meta.parse(strip(lines[1])))
-            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            Acsr = sparse(A)
             sym_default = csr_analyze(Acsr)
             sym_amd = csr_analyze(Acsr; ordering = :amd)
             # :default == :amd here.
@@ -545,7 +540,7 @@ end
             lines = split(text, '\n'; keepempty = false)
             A = eval(Meta.parse(strip(lines[1])))
             b = eval(Meta.parse(strip(lines[2])))
-            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            Acsr = sparse(A)
             sym_adapt = csr_analyze(Acsr; ordering = :adaptive)
             @test sym_adapt.ordering === :amd
             F = csr_factor(Acsr, sym_adapt)
@@ -605,19 +600,20 @@ end
         v1 = randn(length(rows)); v2 = randn(length(rows))
         A1 = sparse(rows, cols, v1, n, n) + 4 * sparse(I, n, n)
         A2 = sparse(rows, cols, v2, n, n) + 4 * sparse(I, n, n)
-        Acsr1 = build_csr(Matrix(A1))
-        Acsr2 = build_csr(Matrix(A2))
         b = randn(n)
 
-        F = csr_qr(Acsr1; ordering = :amd)
+        # The zero-allocation contract is on the native `SparseMatrixCSC` path:
+        # its `colptr`/`rowval`/`nzval` are read straight into the pooled
+        # workspace with no transpose or intermediate allocation.
+        F = csr_qr(A1; ordering = :amd)
         # Warm up.
-        csr_refactor!(F, Acsr2)
-        csr_refactor!(F, Acsr1)
+        csr_refactor!(F, A2)
+        csr_refactor!(F, A1)
 
         # Steady-state: refactor with the cached workspace must allocate 0 bytes.
-        nbytes = @allocated csr_refactor!(F, Acsr2)
+        nbytes = @allocated csr_refactor!(F, A2)
         @test nbytes == 0
-        nbytes = @allocated csr_refactor!(F, Acsr1)
+        nbytes = @allocated csr_refactor!(F, A1)
         @test nbytes == 0
 
         # Sanity check the solution.
@@ -657,7 +653,7 @@ end
             A = eval(Meta.parse(strip(lines[1])))
             b = eval(Meta.parse(strip(lines[2])))
             all(isfinite, b) || continue
-            Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+            Acsr = sparse(A)
             x_sparse = csr_qr(Acsr; ordering = :amd) \ b
             Fd = csr_qr(Acsr; ordering = :amd, adaptive_dense = true)
             x_dense = Fd \ b
@@ -912,7 +908,7 @@ end
                 lines = split(text, '\n'; keepempty = false)
                 A = eval(Meta.parse(strip(lines[1])))
                 b = eval(Meta.parse(strip(lines[2])))
-                Acsr = SparseMatrixCSR(transpose(sparse(transpose(A))))
+                Acsr = sparse(A)
                 F = csr_qr(Acsr; adaptive_dense = true)
                 Fspqr = qr(A)
                 xspqr = Fspqr \ b
@@ -1044,3 +1040,7 @@ end
     end
 
 end
+
+# Dedicated CSC-native core checks (the `SparseMatrixCSC` API is the native,
+# allocation-free path).
+include(joinpath(@__DIR__, "csc_core.jl"))

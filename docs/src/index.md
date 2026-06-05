@@ -4,7 +4,7 @@ SparseColumnPivotedQR.jl is a component of the
 [SciML](https://sciml.ai/) ecosystem providing a pure-Julia,
 rank-revealing, column-pivoted Householder QR factorization that operates
 directly on
-[`SparseMatrixCSR`](https://github.com/gridap/SparseMatricesCSR.jl)
+[`SparseMatrixCSC`](https://docs.julialang.org/en/v1/stdlib/SparseArrays/)
 sparse matrices.
 
 The package targets the same "small-to-medium sparse" niche as KLU does for
@@ -23,16 +23,15 @@ Pkg.add("SparseColumnPivotedQR")
 ## Quick start
 
 ```julia
-using SparseArrays, SparseMatricesCSR, SparseColumnPivotedQR
+using SparseArrays, SparseColumnPivotedQR
 using AMD  # enables the recommended AMD column ordering
 
 # A 5×5 sparse matrix and a right-hand side.
-A_csc = sparse([1.0  0   2   0   0;
-                0    3   0   0   1;
-                4    0   5   0   0;
-                0    0   0   6   0;
-                0    7   0   0   8])
-A = SparseMatrixCSR(A_csc)
+A = sparse([1.0  0   2   0   0;
+            0    3   0   0   1;
+            4    0   5   0   0;
+            0    0   0   6   0;
+            0    7   0   0   8])
 b = [1.0, 2.0, 3.0, 4.0, 5.0]
 
 # One-shot factor + solve.
@@ -93,7 +92,7 @@ least-squares solution whose residual matches the SVD pseudoinverse minimum
 to floating-point precision.
 
 ```julia
-A_singular = SparseMatrixCSR(sparse([1.0 2.0; 0.5 1.0; 2.0 4.0]))  # rank 1
+A_singular = sparse([1.0 2.0; 0.5 1.0; 2.0 4.0])  # rank 1
 b = [1.0, 1.0, 1.0]
 F = csr_qr(A_singular)
 rank(F)              # → 1
