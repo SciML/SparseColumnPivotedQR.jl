@@ -164,31 +164,29 @@ end
 # come from validated CSC structure and `x` is always sized `m2`, so eliding
 # bounds checks here is safe.
 #
-# The optimal annotation differs by element type, measured on the bundled
-# 199×199 test matrices (microbenchmark, ns per full V sweep):
+# The optimal annotation differs by element type. For the hardware floats
+# (Float32/Float64) the gather's contiguous `Vx[vp]` load and the `Vx`
+# multiply DO vectorize under `@simd`: the compiler emits a 4-wide packed
+# reduction (`vfmadd231pd ymm`), assembling the gathered `x[Vi[vp]]` lanes
+# via insert/extract. Measured end-to-end on the bundled 199×199 matrices,
+# `@simd` (reduction-split) beats the manual 2× scalar unroll by ~6.5% on
+# the full factor (2034µs → 1903µs total over the 7 test matrices); it also
+# wins a hair in an isolated full-V-sweep microbench (0.98×). The 4-way
+# reduction's instruction-level parallelism overlaps better with the
+# surrounding kernel work than the tight 2× scalar loop does. The scatter
+# uses `@simd ivdep` (rows within a V column are strictly ascending and
+# distinct, so the scattered writes never alias).
 #
-#                Float64   Float32   ComplexF64  ComplexF32
-#   plain         11.6      11.3       14.8        14.2
-#   @simd         11.0      10.3       14.8        14.1
-#   @simd ivdep   11.0      10.7       19.4 (!)    17.4 (!)
-#   2× unroll      9.8       9.9       17.2        17.1
-#   4× unroll     10.0      10.1       16.5        16.8
+# For complex types `@simd` regresses (the compiler's own complex-mul
+# vectorization is disrupted) and `@simd ivdep` is worse still, so they
+# (and the non-hardware reals) take the generic `@inbounds` path below.
 #
-# For the hardware floats the manual 2× unroll wins (~10-20% over @simd). For
-# complex types it regresses badly (the compiler's own complex-mul
-# vectorization is disrupted), and `@simd ivdep` is the worst of all —
-# confirming the earlier WY-experiment observation.
-#
-# The unroll is gated to `Union{Float32, Float64}` rather than all `T <: Real`:
-# `@simd` can't vectorize non-hardware reals (heap-allocated `BigFloat`,
-# composite `ForwardDiff.Dual`) anyway, and there the `a*b + c*d` paired form
-# only materializes extra temporaries — measured a mild regression (~+4% on
-# BigFloat, ~+10% on `Dual{,2}` at the kernel level). So those (and complex)
-# take the generic `@inbounds` + `conj` path. That path also omits `@simd`:
-# the apply is an indexed gather/scatter (`x[Vi[vp]]`) that doesn't vectorize
-# for these eltypes, so `@simd` only adds the reduction-split overhead —
-# measured slower (`Dual` +18–26%, `ComplexF64` +5%; no-op on `BigFloat`).
-# `ivdep` is never used.
+# The `@simd` path is gated to `Union{Float32, Float64}` rather than all
+# `T <: Real`: `@simd` can't vectorize non-hardware reals (heap-allocated
+# `BigFloat`, composite `ForwardDiff.Dual`) anyway, so for those the
+# reduction-split is pure overhead — measured slower (`Dual` +18–26%,
+# `ComplexF64` +5%; no-op on `BigFloat`). Those (and complex) take the
+# generic `@inbounds` + `conj` path below, which omits `@simd`.
 
 # Gather: tau = Σ conj(Vx[vp]) * x[Vi[vp]] over vp in vc1:vc2.
 @inline function _hh_gather(
@@ -196,14 +194,8 @@ end
         vc1::Int, vc2::Int
     ) where {T <: Union{Float32, Float64}}
     tau = zero(T)
-    vp = vc1
-    @inbounds while vp + 1 <= vc2
-        tau += Vx[vp] * x[Vi[vp]] + Vx[vp + 1] * x[Vi[vp + 1]]
-        vp += 2
-    end
-    @inbounds while vp <= vc2
+    @inbounds @simd for vp in vc1:vc2
         tau += Vx[vp] * x[Vi[vp]]
-        vp += 1
     end
     return tau
 end
@@ -229,15 +221,8 @@ end
         Vx::AbstractVector{T}, Vi::Vector{Int}, x::Vector{T},
         vc1::Int, vc2::Int, scale::T
     ) where {T <: Union{Float32, Float64}}
-    vp = vc1
-    @inbounds while vp + 1 <= vc2
+    @inbounds @simd ivdep for vp in vc1:vc2
         x[Vi[vp]] -= scale * Vx[vp]
-        x[Vi[vp + 1]] -= scale * Vx[vp + 1]
-        vp += 2
-    end
-    @inbounds while vp <= vc2
-        x[Vi[vp]] -= scale * Vx[vp]
-        vp += 1
     end
     return nothing
 end
@@ -1785,7 +1770,7 @@ function _csc_qr_numeric!(
         # --- 3) Build Householder for x[vrows[1..vlen]] -----------------
         # Compute alpha, beta_k. v[1] = x[vrows[1]] - alpha; v[j>=2] unchanged.
         nrm2 = zero(RT)
-        for q in 1:vlen
+        @simd for q in 1:vlen
             nrm2 += abs2(x[vrows[q]])
         end
 
