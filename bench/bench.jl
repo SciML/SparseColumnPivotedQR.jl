@@ -94,47 +94,47 @@ for f in files
 
     # 0) SparseColumnPivotedQR — default ordering (:amd when AMD loaded,
     # which it is here). This is what the common convenience entry point
-    # `csr_qr(A)` does without an explicit ordering=.
-    F = csr_qr(Acsr); x = F \ b
+    # `scpqr(A)` does without an explicit ordering=.
+    F = scpqr(Acsr); x = F \ b
     t = @benchmark begin
-        F2 = csr_qr($Acsr); $x .= F2 \ $b
+        F2 = scpqr($Acsr); $x .= F2 \ $b
     end seconds = 1
     res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
     fmt_row(short, "CSR-QR default", minimum(t.times) / 1000, res, nn)
 
-    # 1) SparseColumnPivotedQR — natural ordering (opt-in), one-shot csr_qr
-    F = csr_qr(Acsr; ordering = :natural); x = F \ b
+    # 1) SparseColumnPivotedQR — natural ordering (opt-in), one-shot scpqr
+    F = scpqr(Acsr; ordering = :natural); x = F \ b
     t = @benchmark begin
-        F2 = csr_qr($Acsr; ordering = :natural); $x .= F2 \ $b
+        F2 = scpqr($Acsr; ordering = :natural); $x .= F2 \ $b
     end seconds = 1
     res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
     fmt_row(short, "CSR-QR natural", minimum(t.times) / 1000, res, nn)
 
-    # 2) SparseColumnPivotedQR — AMD ordering, one-shot csr_qr
-    F = csr_qr(Acsr; ordering = :amd); x = F \ b
+    # 2) SparseColumnPivotedQR — AMD ordering, one-shot scpqr
+    F = scpqr(Acsr; ordering = :amd); x = F \ b
     t = @benchmark begin
-        F2 = csr_qr($Acsr; ordering = :amd); $x .= F2 \ $b
+        F2 = scpqr($Acsr; ordering = :amd); $x .= F2 \ $b
     end seconds = 1
     res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
     fmt_row(short, "CSR-QR amd", minimum(t.times) / 1000, res, nn)
 
-    # 2b) SparseColumnPivotedQR — adaptive ordering, one-shot csr_qr
-    F = csr_qr(Acsr; ordering = :adaptive); x = F \ b
+    # 2b) SparseColumnPivotedQR — adaptive ordering, one-shot scpqr
+    F = scpqr(Acsr; ordering = :adaptive); x = F \ b
     t = @benchmark begin
-        F2 = csr_qr($Acsr; ordering = :adaptive); $x .= F2 \ $b
+        F2 = scpqr($Acsr; ordering = :adaptive); $x .= F2 \ $b
     end seconds = 1
     res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
     fmt_row(short, "CSR-QR adaptive", minimum(t.times) / 1000, res, nn)
 
     # 3) SparseColumnPivotedQR — refactor! reusing natural symbolic
-    sym = csr_analyze(Acsr; ordering = :natural)
-    F0 = csr_factor(Acsr, sym); x = F0 \ b
+    sym = scpqr_analyze(Acsr; ordering = :natural)
+    F0 = scpqr_factor(Acsr, sym); x = F0 \ b
     t = @benchmark begin
-        F2 = csr_refactor!($F0, $Acsr); $x .= F2 \ $b
+        F2 = scpqr_refactor!($F0, $Acsr); $x .= F2 \ $b
     end seconds = 1
     res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
@@ -143,10 +143,10 @@ for f in files
     # 3b) SparseColumnPivotedQR — refactor! reusing AMD symbolic. This is
     # the apples-to-apples comparison to CXSparse cs_qr: AMD ordering up front
     # and only the numeric phase running per solve call.
-    sym_amd = csr_analyze(Acsr; ordering = :amd)
-    F0_amd = csr_factor(Acsr, sym_amd); x = F0_amd \ b
+    sym_amd = scpqr_analyze(Acsr; ordering = :amd)
+    F0_amd = scpqr_factor(Acsr, sym_amd); x = F0_amd \ b
     t = @benchmark begin
-        F2 = csr_refactor!($F0_amd, $Acsr); $x .= F2 \ $b
+        F2 = scpqr_refactor!($F0_amd, $Acsr); $x .= F2 \ $b
     end seconds = 1
     res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)
@@ -155,10 +155,10 @@ for f in files
     # 3c) SparseColumnPivotedQR — adaptive dense fallback on top of AMD.
     # Probes whether materializing the late-fill block + LAPACK geqp3 is
     # cheaper than continuing in sparse Householder land.
-    sym_amd_ad = csr_analyze(Acsr; ordering = :amd)
-    F0_ad = csr_factor(Acsr, sym_amd_ad; adaptive_dense = true); x = F0_ad \ b
+    sym_amd_ad = scpqr_analyze(Acsr; ordering = :amd)
+    F0_ad = scpqr_factor(Acsr, sym_amd_ad; adaptive_dense = true); x = F0_ad \ b
     t = @benchmark begin
-        F2 = csr_refactor!($F0_ad, $Acsr; adaptive_dense = true); $x .= F2 \ $b
+        F2 = scpqr_refactor!($F0_ad, $Acsr; adaptive_dense = true); $x .= F2 \ $b
     end seconds = 1
     res = all(isfinite, x) ? norm(A * x - b) : NaN
     nn = count(!isfinite, x)

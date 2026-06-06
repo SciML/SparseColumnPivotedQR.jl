@@ -1,9 +1,9 @@
 # API reference
 
 ```@docs
-csr_qr
-csr_analyze
-csr_factor
-csr_refactor!
+scpqr
+scpqr_analyze
+scpqr_factor
+scpqr_refactor!
 has_amd_extension
 ```

@@ -16,7 +16,7 @@ nonlinear-solve regression. Each file contains two Julia expressions:
 | `linsolve_5.txt` | 199 | full rank |
 | `linsolve_6.txt` | —   | pathological: `b` contains `NaN` |
 
-Used by the test suite to verify that `csr_qr` produces:
+Used by the test suite to verify that `scpqr` produces:
 
 - residuals matching SPQR / SVD-pseudoinverse on the rank-deficient cases,
 - finite `x` on every case where `b` is finite,
