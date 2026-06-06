@@ -35,7 +35,7 @@ A = sparse([1.0  0   2   0   0;
 b = [1.0, 2.0, 3.0, 4.0, 5.0]
 
 # One-shot factor + solve.
-F = csr_qr(A)
+F = scpqr(A)
 x = F \ b
 
 # Rank and dimensions.
@@ -44,7 +44,7 @@ rank(F), size(F)
 
 ## Column ordering
 
-`csr_qr` / `csr_analyze` accept an `ordering` keyword. Available choices:
+`scpqr` / `scpqr_analyze` accept an `ordering` keyword. Available choices:
 
 | ordering    | meaning                                                              |
 |-------------|----------------------------------------------------------------------|
@@ -62,15 +62,15 @@ explicitly for matrices that are already well-ordered (block diagonal,
 banded, etc.).
 
 ```julia
-F1 = csr_qr(A)                          # = :default (= :amd if AMD loaded)
-F2 = csr_qr(A; ordering = :natural)     # opt-in to the chain etree
-F3 = csr_qr(A; ordering = :amd)         # explicit :amd; errors if AMD.jl not loaded
-F4 = csr_qr(A; ordering = :adaptive)    # build both, keep the shallower etree
+F1 = scpqr(A)                          # = :default (= :amd if AMD loaded)
+F2 = scpqr(A; ordering = :natural)     # opt-in to the chain etree
+F3 = scpqr(A; ordering = :amd)         # explicit :amd; errors if AMD.jl not loaded
+F4 = scpqr(A; ordering = :adaptive)    # build both, keep the shallower etree
 ```
 
 ## Approximate factorization
 
-`csr_qr` accepts a `drop_tol::Real` keyword (default `0`). When
+`scpqr` accepts a `drop_tol::Real` keyword (default `0`). When
 `drop_tol > 0`, entries of each Householder vector `V[:, k]` with
 `|v_i| <= drop_tol * ‖v‖` are discarded after the reflector is built;
 `β_k` is rescaled for the truncated vector so `H̃ = I - β̃ ṽ ṽᵀ` remains
@@ -80,8 +80,8 @@ entries on every subsequent call. Useful when you can tolerate a larger
 residual to shrink the factorized form.
 
 ```julia
-F_exact = csr_qr(A)                    # drop_tol = 0
-F_approx = csr_qr(A; drop_tol = 1e-8)  # smaller V, larger ‖A x - b‖
+F_exact = scpqr(A)                    # drop_tol = 0
+F_approx = scpqr(A; drop_tol = 1e-8)  # smaller V, larger ‖A x - b‖
 ```
 
 ## Rank-deficient inputs
@@ -94,7 +94,7 @@ to floating-point precision.
 ```julia
 A_singular = sparse([1.0 2.0; 0.5 1.0; 2.0 4.0])  # rank 1
 b = [1.0, 1.0, 1.0]
-F = csr_qr(A_singular)
+F = scpqr(A_singular)
 rank(F)              # → 1
 norm(A_singular * (F \ b) - b)   # matches the SVD minimum residual
 ```

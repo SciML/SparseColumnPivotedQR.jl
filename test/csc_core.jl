@@ -18,7 +18,7 @@ using AMD
             base = sprand(Float64, n, n, 0.2) + 5I
             A = convert(SparseMatrixCSC{T, Int}, cv(Matrix(base)))
             b = ones(T, n)
-            F = csr_qr(A)
+            F = scpqr(A)
             x = F \ b
             @test norm(A * x - b) / norm(b) < 1.0e-9
             @test rank(F) == n
@@ -31,7 +31,7 @@ using AMD
             base = base + sparse(1:n, 1:n, ones(n), m, n)
             A = convert(SparseMatrixCSC{T, Int}, cv(Matrix(base)))
             b = randn(T, m)
-            F = csr_qr(A)
+            F = scpqr(A)
             x = F \ b
             # Full-column-rank tall LS: the dense `\` is the unique LS solution.
             @test x ≈ Matrix(A) \ b rtol = 1.0e-8
@@ -45,7 +45,7 @@ using AMD
             base = base + sparse(1:m, 1:m, ones(m), m, n)
             A = convert(SparseMatrixCSC{T, Int}, cv(Matrix(base)))
             b = randn(T, m)
-            F = csr_qr(A)
+            F = scpqr(A)
             x = F \ b
             @test norm(A * x - b) / norm(b) < 1.0e-8   # consistent system
             @test rank(F) == m
@@ -60,7 +60,7 @@ using AMD
             M[:, n] = M[:, 1]          # duplicate column -> rank n-1
             A = convert(SparseMatrixCSC{T, Int}, cv(M))
             b = randn(T, m)
-            F = csr_qr(A)
+            F = scpqr(A)
             @test rank(F) == n - 1
             x = F \ b
             # Minimum-residual solve: the residual must match the true
@@ -71,7 +71,7 @@ using AMD
             @test r_csc ≈ r_min rtol = 1.0e-6
         end
 
-        @testset "csr_refactor! reuse path ($T)" begin
+        @testset "scpqr_refactor! reuse path ($T)" begin
             Random.seed!(5)
             n = 30
             sp = sprand(Float64, n, n, 0.2)
@@ -83,16 +83,16 @@ using AMD
             A1 = mk(randn(length(rows)))
             A2 = mk(randn(length(rows)))
             b = randn(T, n)
-            F = csr_qr(A1; ordering = :amd)
-            csr_refactor!(F, A2)
+            F = scpqr(A1; ordering = :amd)
+            scpqr_refactor!(F, A2)
             x2 = F \ b
             @test norm(A2 * x2 - b) / norm(b) < 1.0e-9
-            csr_refactor!(F, A1)
+            scpqr_refactor!(F, A1)
             x1 = F \ b
             @test norm(A1 * x1 - b) / norm(b) < 1.0e-9
         end
 
-        @testset "csr_refactor! zero-alloc steady state ($T)" begin
+        @testset "scpqr_refactor! zero-alloc steady state ($T)" begin
             Random.seed!(6)
             n = 30
             sp = sprand(Float64, n, n, 0.2)
@@ -103,11 +103,11 @@ using AMD
             )
             A1 = mk(randn(length(rows)))
             A2 = mk(randn(length(rows)))
-            F = csr_qr(A1; ordering = :amd)
-            csr_refactor!(F, A2)   # warm
-            csr_refactor!(F, A1)
-            @test (@allocated csr_refactor!(F, A2)) == 0
-            @test (@allocated csr_refactor!(F, A1)) == 0
+            F = scpqr(A1; ordering = :amd)
+            scpqr_refactor!(F, A2)   # warm
+            scpqr_refactor!(F, A1)
+            @test (@allocated scpqr_refactor!(F, A2)) == 0
+            @test (@allocated scpqr_refactor!(F, A1)) == 0
         end
     end
 end
