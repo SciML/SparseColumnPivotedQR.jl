@@ -1,4 +1,18 @@
 using Test
+
+# CI dispatches test groups through the GROUP env var (see test/test_groups.toml
+# and the grouped-tests.yml caller). "All" runs everything; "QA" runs only the
+# Aqua/JET metadata checks from their isolated test/qa environment.
+const GROUP = get(ENV, "GROUP", "All")
+
+if GROUP == "QA"
+    using Pkg
+    Pkg.activate(joinpath(@__DIR__, "qa"))
+    Pkg.instantiate()
+    include(joinpath(@__DIR__, "qa", "qa.jl"))
+    exit()
+end
+
 using LinearAlgebra
 using SparseArrays
 using Random
