@@ -20,22 +20,8 @@ concurrency:
 
 jobs:
   tests:
-    name: "Tests"
-    strategy:
-      fail-fast: false
-      matrix:
-        version:
-          - "1"
-          - "lts"
-          - "pre"
-        os:
-          - "ubuntu-latest"
-          - "macos-latest"
-          - "windows-latest"
-    uses: "SciML/.github/.github/workflows/tests.yml@v1"
+    uses: "SciML/.github/.github/workflows/grouped-tests.yml@v1"
     with:
-      julia-version: "${{ matrix.version }}"
-      os: "${{ matrix.os }}"
       # Disable codecov upload until CODECOV_TOKEN is configured on the repo;
       # see https://docs.codecov.com/docs/codecov-uploader#using-an-upload-token
       coverage: false
