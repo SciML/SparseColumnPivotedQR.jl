@@ -1,12 +1,12 @@
 module SparseColumnPivotedQR
 
-using LinearAlgebra
-using SparseArrays
+using LinearAlgebra: LinearAlgebra, pinv
+using SparseArrays: SparseArrays, SparseMatrixCSC, nonzeros, rowvals, sparse
 using SparseArrays: getcolptr
-using PrecompileTools
+using PrecompileTools: PrecompileTools, @compile_workload, @setup_workload
 
 import LinearAlgebra: ldiv!, rank, Adjoint, Transpose
-import Base: \, size, eltype
+import Base: \, size
 
 export scpqr, scpqr_analyze, scpqr_factor, scpqr_refactor!,
     has_amd_extension,
