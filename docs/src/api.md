@@ -1,6 +1,8 @@
 # API reference
 
 ```@docs
+SparseColumnPivotedQRSymbolic
+SparseColumnPivotedQRFactorization
 scpqr
 scpqr_analyze
 scpqr_factor
