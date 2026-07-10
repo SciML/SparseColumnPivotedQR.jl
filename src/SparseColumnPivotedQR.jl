@@ -383,6 +383,28 @@ function _alloc_workspace(
     )
 end
 
+"""
+    SparseColumnPivotedQRSymbolic
+
+Symbolic analysis object returned by [`scpqr_analyze`](@ref). It stores the
+matrix dimensions, ordering choice, symbolic permutations, elimination tree,
+nonzero bounds for the numeric factors, a snapshot of the input sparsity
+pattern, and the reusable numeric workspace used by [`scpqr_factor`](@ref) and
+[`scpqr_refactor!`](@ref).
+
+Construct this object with `scpqr_analyze(A; ordering)` rather than calling the
+field constructor directly.
+
+# Example
+
+```julia
+using SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0])
+sym = scpqr_analyze(A; ordering = :natural)
+size(sym) == (2, 2)
+```
+"""
 mutable struct SparseColumnPivotedQRSymbolic
     m::Int
     n::Int
@@ -417,6 +439,31 @@ Base.size(S::SparseColumnPivotedQRSymbolic) = (S.m, S.n)
 # CSC storage of V (Householders) and R, plus beta (Householder coefficients),
 # plus the symbolic. Permutations come from `sym`.
 
+"""
+    SparseColumnPivotedQRFactorization
+
+Sparse column-pivoted QR factorization returned by [`scpqr`](@ref),
+[`scpqr_factor`](@ref), and [`scpqr_refactor!`](@ref). It stores the sparse
+Householder vectors, the upper-triangular `R` factor, Householder coefficients,
+rank estimate, tolerance, symbolic analysis object, and any dense-tail
+factorization data produced by `adaptive_dense=true`.
+
+Use `size(F)`, `rank(F)`, `F \\ b`, `ldiv!(x, F, b)`, and adjoint or transpose
+solves (`F' \\ b`, `transpose(F) \\ b`) for the supported factorization
+operations.
+
+# Example
+
+```julia
+using LinearAlgebra, SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0; 1.0 1.0])
+b = [1.0, 2.0, 3.0]
+F = scpqr(A; ordering = :natural)
+x = F \\ b
+rank(F) == 2
+```
+"""
 mutable struct SparseColumnPivotedQRFactorization{T, RT}
     m::Int
     n::Int
@@ -636,6 +683,14 @@ Returns `true` iff the `AMD.jl` extension has been loaded into the current
 session (i.e. `using AMD` has been executed). The default ordering
 `:default` resolves to `:amd` only when this is `true`, falling back to
 `:natural` otherwise.
+
+# Example
+
+```julia
+using SparseColumnPivotedQR
+
+has_amd_extension() isa Bool
+```
 """
 has_amd_extension() = _AMD_EXT_LOADED[]
 
@@ -904,6 +959,16 @@ allocation.
 
 Returns a `SparseColumnPivotedQRSymbolic` that can be passed to `scpqr_factor` and reused via
 `scpqr_refactor!` for matrices with identical sparsity patterns.
+
+# Example
+
+```julia
+using SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0])
+sym = scpqr_analyze(A; ordering = :natural)
+size(sym) == (2, 2)
+```
 """
 function scpqr_analyze(A::SparseMatrixCSC; ordering::Symbol = :default)
     m, n = size(A)
@@ -985,6 +1050,17 @@ just-emitted Householder columns. Once the active submatrix exceeds
 consecutive columns, it materializes the trailing block as a dense matrix
 and finishes with LAPACK `geqp3!`. The composed column permutation is
 stored in `F.q_eff`.
+
+# Example
+
+```julia
+using LinearAlgebra, SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0; 1.0 1.0])
+sym = scpqr_analyze(A; ordering = :natural)
+F = scpqr_factor(A, sym)
+rank(F) == 2
+```
 """
 function scpqr_factor(
         A::SparseMatrixCSC{T}, sym::SparseColumnPivotedQRSymbolic;
@@ -1010,6 +1086,17 @@ AMD.jl extension is loaded (`using AMD`) and `:natural` otherwise. On the
 typical dense-fill matrices that arise from nonlinear solver linsolves,
 `:amd` roughly halves the factor time. Pass `ordering=:natural` to opt out
 for matrices whose columns are already well-ordered.
+
+# Example
+
+```julia
+using SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0; 1.0 1.0])
+b = [1.0, 2.0, 3.0]
+F = scpqr(A; ordering = :natural)
+x = F \\ b
+```
 """
 function scpqr(
         A::SparseMatrixCSC;
@@ -1044,6 +1131,18 @@ same meaning as in [`scpqr_factor`](@ref).
 `F`'s `V_*`, `R_*`, `beta` buffers are overwritten with the new values
 (growing only if the previous bounds were undersized). The return value is
 `F` itself.
+
+# Example
+
+```julia
+using SparseArrays, SparseColumnPivotedQR
+
+A = sparse([1.0 0.0; 0.0 2.0; 1.0 1.0])
+F = scpqr(A; ordering = :natural)
+A2 = copy(A)
+A2[1, 1] = 3.0
+scpqr_refactor!(F, A2)
+```
 """
 function scpqr_refactor!(
         F::SparseColumnPivotedQRFactorization{T},
