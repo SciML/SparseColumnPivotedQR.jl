@@ -4,7 +4,6 @@ using JET
 run_qa(
     SparseColumnPivotedQR;
     explicit_imports = true,
-    api_docs_kwargs = (; rendered = true),
     # JET report_package surfaces 4 union-split `no matching method` errors on the
     # `\` solve paths (`x = zeros(T, F.n)` infers a `Matrix` branch with no
     # `ldiv!`/`_ldiv_adjoint!` match) — tracked in
