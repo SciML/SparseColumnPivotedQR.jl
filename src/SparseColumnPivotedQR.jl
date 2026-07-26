@@ -2,7 +2,6 @@ module SparseColumnPivotedQR
 
 using LinearAlgebra: LinearAlgebra, pinv
 using SparseArrays: SparseArrays, SparseMatrixCSC, nonzeros, rowvals, sparse
-using SparseArrays: getcolptr
 using PrecompileTools: PrecompileTools, @compile_workload, @setup_workload
 
 import LinearAlgebra: ldiv!, rank, Adjoint, Transpose
@@ -12,126 +11,77 @@ export scpqr, scpqr_analyze, scpqr_factor, scpqr_refactor!,
     has_amd_extension,
     SparseColumnPivotedQRSymbolic, SparseColumnPivotedQRFactorization
 
-# The adaptive-dense fallback finishes the trailing dense block with LAPACK
-# `geqp3!` / `ormqr!`, which are only defined for the four BLAS float types
+# The adaptive-dense fallback finishes the trailing dense block with an in-place
+# column-pivoted Householder QR, which is only defined for the four BLAS float types
 # (Float32/Float64/ComplexF32/ComplexF64). For any other element type (e.g.
 # `BigFloat` or `ForwardDiff.Dual`) the dense path is unavailable, so we
 # transparently ignore `adaptive_dense` and run the pure-Julia sparse kernel.
-@inline _is_blas_eltype(::Type{T}) where {T} = T <: LinearAlgebra.BlasFloat
+const _DenseQREltype = Union{Float32, Float64, ComplexF32, ComplexF64}
+
+@inline _is_blas_eltype(::Type{T}) where {T} = T <: _DenseQREltype
 
 # ---------------------------------------------------------------------------
-# Allocation-free LAPACK geqp3 (column-pivoted QR of the dense tail).
+# Allocation-free dense column-pivoted QR.
 # ---------------------------------------------------------------------------
 #
-# `LinearAlgebra.LAPACK.geqp3!` allocates a fresh `work` buffer (and, for
-# complex types, an `rwork` buffer) plus an `info` cell on every call, and it
-# performs a workspace-size query (`lwork = -1`) call followed by the real
-# call each time. For the real-time `scpqr_refactor!(adaptive_dense=true)` loop
-# we instead pass in a `work`/`rwork`/`info` triple that lives on the pooled
-# workspace and was sized once via `_geqp3_lwork`. This makes the dense tail's
-# geqp3 call do zero heap work in steady state. The bindings mirror the
-# stdlib `ccall`s exactly (LAPACK BLAS-float types only).
-
-for (geqp3, elty, relty) in (
-        (:dgeqp3_, :Float64, :Float64),
-        (:sgeqp3_, :Float32, :Float32),
-        (:zgeqp3_, :ComplexF64, :Float64),
-        (:cgeqp3_, :ComplexF32, :Float32),
-    )
-    iscmplx = elty in (:ComplexF64, :ComplexF32)
-    @eval begin
-        # Query the optimal `lwork` for an `m x n` geqp3 (one workspace call).
-        function _geqp3_lwork(
-                A::Matrix{$elty}, jpvt::Vector{LinearAlgebra.BlasInt},
-                tau::Vector{$elty}
-            )
-            m, n = size(A)
-            lda = max(1, stride(A, 2))
-            work = Vector{$elty}(undef, 1)
-            lwork = LinearAlgebra.BlasInt(-1)
-            info = Ref{LinearAlgebra.BlasInt}()
-            $(
-                if iscmplx
-                    quote
-                        rwork = Vector{$relty}(undef, max(1, 2n))
-                        ccall(
-                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
-                            Cvoid,
-                            (
-                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$relty}, Ptr{LinearAlgebra.BlasInt},
-                            ),
-                            m, n, A, lda, jpvt, tau, work, lwork, rwork, info
-                        )
-                    end
-                else
-                    quote
-                        ccall(
-                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
-                            Cvoid,
-                            (
-                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{LinearAlgebra.BlasInt},
-                            ),
-                            m, n, A, lda, jpvt, tau, work, lwork, info
-                        )
-                    end
-                end
-            )
-            LinearAlgebra.LAPACK.chklapackerror(info[])
-            return LinearAlgebra.BlasInt(real(work[1]))
+# The public `LinearAlgebra.LAPACK.geqp3!` API allocates a work buffer on every
+# call. The adaptive refactor contract is allocation-free, so the dense-tail
+# kernel is implemented locally instead of reaching into LinearAlgebra's
+# nonpublic `@blasfunc`/`libblastrampoline` bindings. It stores the compact
+# Householder representation consumed by `_apply_QH!` and `_apply_Q!` below.
+function _dense_cpqr!(A::Matrix{T}, jpvt::Vector{Int}, tau::Vector{T}) where {T <: _DenseQREltype}
+    m, n = size(A)
+    @inbounds for j in 1:n
+        jpvt[j] = j
+    end
+    @inbounds for k in 1:min(m, n)
+        pivot = k
+        best_norm2 = zero(real(T))
+        for j in k:n
+            norm2 = zero(real(T))
+            for i in k:m
+                norm2 += abs2(A[i, j])
+            end
+            if norm2 > best_norm2
+                best_norm2 = norm2
+                pivot = j
+            end
+        end
+        if pivot != k
+            for i in 1:m
+                A[i, k], A[i, pivot] = A[i, pivot], A[i, k]
+            end
+            jpvt[k], jpvt[pivot] = jpvt[pivot], jpvt[k]
         end
 
-        # geqp3! reusing caller-owned `work`/`rwork`/`info` (no allocation).
-        # `jpvt` must be pre-zeroed (0 = column free to be pivoted). `work`
-        # must be at least the `_geqp3_lwork` size for this `A`.
-        function _geqp3_prealloc!(
-                A::Matrix{$elty}, jpvt::Vector{LinearAlgebra.BlasInt},
-                tau::Vector{$elty}, work::Vector{$elty},
-                rwork::Vector{$relty}, info::Base.RefValue{LinearAlgebra.BlasInt}
-            )
-            m, n = size(A)
-            lda = max(1, stride(A, 2))
-            lwork = LinearAlgebra.BlasInt(length(work))
-            $(
-                if iscmplx
-                    quote
-                        ccall(
-                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
-                            Cvoid,
-                            (
-                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$relty}, Ptr{LinearAlgebra.BlasInt},
-                            ),
-                            m, n, A, lda, jpvt, tau, work, lwork, rwork, info
-                        )
-                    end
-                else
-                    quote
-                        ccall(
-                            (LinearAlgebra.BLAS.@blasfunc($geqp3), LinearAlgebra.BLAS.libblastrampoline),
-                            Cvoid,
-                            (
-                                Ref{LinearAlgebra.BlasInt}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ref{LinearAlgebra.BlasInt}, Ptr{LinearAlgebra.BlasInt},
-                                Ptr{$elty}, Ptr{$elty}, Ref{LinearAlgebra.BlasInt},
-                                Ptr{LinearAlgebra.BlasInt},
-                            ),
-                            m, n, A, lda, jpvt, tau, work, lwork, info
-                        )
-                    end
-                end
-            )
-            LinearAlgebra.LAPACK.chklapackerror(info[])
-            return A, tau, jpvt
+        alpha = A[k, k]
+        normx = sqrt(best_norm2)
+        if normx == zero(normx)
+            tau[k] = zero(T)
+            continue
+        end
+        phase = alpha == zero(T) ? one(T) : alpha / abs(alpha)
+        beta = -phase * T(normx)
+        tau_k = (beta - alpha) / beta
+        tau[k] = tau_k
+        A[k, k] = beta
+        scale = inv(alpha - beta)
+        for i in (k + 1):m
+            A[i, k] *= scale
+        end
+        for j in (k + 1):n
+            dot = A[k, j]
+            for i in (k + 1):m
+                dot += conj(A[i, k]) * A[i, j]
+            end
+            coeff = conj(tau_k) * dot
+            A[k, j] -= coeff
+            for i in (k + 1):m
+                A[i, j] -= coeff * A[i, k]
+            end
         end
     end
+    return A, tau, jpvt
 end
 
 # Grow a (rowval, nzval) pair so that both have at least `needed` capacity.
@@ -328,22 +278,16 @@ mutable struct _CSRQRWorkspace{T, RT}
     # whose factorization never transitions to dense, and for non-BLAS element
     # types (where the dense path is unavailable, so they are never used).
     #
-    #   dense_D     : (m2 - ks) x (n - ks) compact LAPACK geqp3 form.
+    #   dense_D     : (m2 - ks) x (n - ks) compact dense CPQR form.
     #   dense_topR  : ks x (n - ks) staging of the top R rows.
-    #   dense_jpvt  : geqp3 column-pivot output, length (n - ks).
-    #   dense_tau   : geqp3 Householder coeffs, length min(m_active, n_active).
+    #   dense_jpvt  : CPQR column-pivot output, length (n - ks).
+    #   dense_tau   : CPQR Householder coefficients, length min(m_active, n_active).
     #   dense_qeff  : composed column permutation, length n.
-    #   dense_work  : preallocated geqp3 work buffer (lwork queried once).
-    #   dense_rwork : preallocated real work for the complex geqp3 (len 2*n_active).
-    #   dense_info  : geqp3 info return cell (reused, never reallocated).
     dense_D::Matrix{T}
     dense_topR::Matrix{T}
-    dense_jpvt::Vector{LinearAlgebra.BlasInt}
+    dense_jpvt::Vector{Int}
     dense_tau::Vector{T}
     dense_qeff::Vector{Int}
-    dense_work::Vector{T}
-    dense_rwork::Vector{RT}
-    dense_info::Base.RefValue{LinearAlgebra.BlasInt}
 end
 
 function _alloc_workspace(
@@ -374,12 +318,9 @@ function _alloc_workspace(
         Vector{T}(undef, n),
         Matrix{T}(undef, 0, 0),
         Matrix{T}(undef, 0, 0),
-        LinearAlgebra.BlasInt[],
-        T[],
         Int[],
         T[],
-        RT[],
-        Ref{LinearAlgebra.BlasInt}(0),
+        Int[],
     )
 end
 
@@ -478,14 +419,14 @@ mutable struct SparseColumnPivotedQRFactorization{T, RT}
     tol::RT
     sym::SparseColumnPivotedQRSymbolic
     # Adaptive dense fallback. When the active submatrix becomes dense enough
-    # mid-factorization we switch to LAPACK geqp3 on the trailing block. The
+    # mid-factorization we switch to local column-pivoted QR on the trailing block. The
     # fields below describe that block; they are zero-length / `k_dense == 0`
     # when no transition occurred.
     #
     # `k_dense`     : sparse Householders are V[:, 1..k_dense]; dense tail
     #                 covers columns k_dense+1..n.
-    # `D`           : (m2 - k_dense) x (n - k_dense) compact LAPACK form from
-    #                 geqp3 — strict lower triangle = Householder vectors v,
+    # `D`           : (m2 - k_dense) x (n - k_dense) compact CPQR form —
+    #                 strict lower triangle = Householder vectors v,
     #                 upper triangle = R (also redundantly emitted into CSC R).
     # `dtau`        : Householder coefficients τ for the dense tail.
     # `q_eff`       : composed column permutation (length n). Equals sym.q
@@ -546,7 +487,7 @@ function _capture_pattern(A::SparseMatrixCSC)
     # Normalize to `Vector{Int}`: the symbolic machinery is `Int`-indexed, and
     # a CSC built from `Int32` arrays would otherwise carry a narrower index
     # type through the captured pattern.
-    colptr = convert(Vector{Int}, getcolptr(A))
+    colptr = convert(Vector{Int}, A.colptr)
     rowval = convert(Vector{Int}, rowvals(A))
     rowptr, colval = _csc_pattern_to_csr(colptr, rowval, m, n)
     return rowptr, colval, colptr, rowval
@@ -558,7 +499,7 @@ end
 function _pattern_matches(S::SparseColumnPivotedQRSymbolic, A::SparseMatrixCSC)
     m, n = size(A)
     (m == S.m && n == S.n) || return false
-    colptr = getcolptr(A)
+    colptr = A.colptr
     rowval = rowvals(A)
     length(colptr) == length(S.pattern_colptr) || return false
     length(rowval) == length(S.pattern_rowval) || return false
@@ -1048,7 +989,7 @@ If `adaptive_dense=true`, the numeric kernel monitors the density of the
 just-emitted Householder columns. Once the active submatrix exceeds
 `dense_threshold * (m2 - k + 1)` density (default 40%) over several
 consecutive columns, it materializes the trailing block as a dense matrix
-and finishes with LAPACK `geqp3!`. The composed column permutation is
+and finishes with a dense column-pivoted QR. The composed column permutation is
 stored in `F.q_eff`.
 
 # Example
@@ -1426,7 +1367,7 @@ function _csc_copy_with_norms!(
         A::SparseMatrixCSC{T}
     ) where {T, RT}
     m, n = size(A)
-    colptr_in = getcolptr(A)
+    colptr_in = A.colptr
     rowval_in = rowvals(A)
     nzval_in = nonzeros(A)
 
@@ -1679,7 +1620,7 @@ function _csc_qr_numeric!(
     ) where {T, RT}
     drop_active = drop_tol > zero(RT)
     drop_tol2 = drop_tol * drop_tol
-    # The dense fallback relies on LAPACK geqp3!/ormqr!, which exist only for
+    # The dense fallback relies on the local CPQR kernel, which is available only for
     # BLAS float types. For generic T (e.g. BigFloat, ForwardDiff.Dual) just run
     # the pure-Julia sparse kernel to completion.
     if adaptive_dense && !_is_blas_eltype(T)
@@ -2072,10 +2013,8 @@ function _csc_qr_numeric!(
     #   `top_R` : top_R[i, j] = R[i, ks + j]. Only ereach-pattern rows are
     #             written; the rest must read back as zero, so the used
     #             [1:ks, 1:n_active] block is zeroed before the column loop.
-    dims_changed = false
     if size(ws.dense_D, 1) != m_active || size(ws.dense_D, 2) != n_active
         ws.dense_D = Matrix{T}(undef, m_active, n_active)
-        dims_changed = true
     end
     if size(ws.dense_topR, 1) != ks || size(ws.dense_topR, 2) != n_active
         ws.dense_topR = Matrix{T}(undef, ks, n_active)
@@ -2142,13 +2081,12 @@ function _csc_qr_numeric!(
         end
     end
 
-    # 4) Run LAPACK column-pivoted QR on D. Result:
+    # 4) Run local column-pivoted QR on D. Result:
     #    - Upper triangle of D[1:n_active, 1:n_active] = R_dense
     #    - Strict lower triangle = Householder v's
     #    - dtau = Householder coefficients
     #    - jpvt = column permutation of the dense block (1-based)
-    # Pooled jpvt / dtau (sized to the fixed dense-tail dims). jpvt must be
-    # zero before geqp3 (0 = column free to be pivoted).
+    # Pooled jpvt / dtau are sized to the fixed dense-tail dimensions.
     ntau = min(m_active, n_active)
     if length(ws.dense_jpvt) != n_active
         resize!(ws.dense_jpvt, n_active)
@@ -2158,21 +2096,7 @@ function _csc_qr_numeric!(
     end
     jpvt = ws.dense_jpvt
     dtau = ws.dense_tau
-    @inbounds for j in 1:n_active
-        jpvt[j] = zero(LinearAlgebra.BlasInt)
-    end
-    # Pooled geqp3 work buffer: query the optimal lwork once (when unsized or
-    # the dense-tail dims changed) and reuse thereafter, so the geqp3 call
-    # itself allocates nothing in steady state. The query (`lwork = -1`) only
-    # writes the optimal size into `work[1]`; it does not touch `D`/`jpvt`.
-    if isempty(ws.dense_work) || dims_changed
-        lw = _geqp3_lwork(D, jpvt, dtau)
-        resize!(ws.dense_work, max(1, Int(lw)))
-    end
-    if T <: Complex && length(ws.dense_rwork) != max(1, 2 * n_active)
-        resize!(ws.dense_rwork, max(1, 2 * n_active))
-    end
-    _geqp3_prealloc!(D, jpvt, dtau, ws.dense_work, ws.dense_rwork, ws.dense_info)
+    _dense_cpqr!(D, jpvt, dtau)
 
     # 5) Compose q_eff = [sym.q[1..ks]; sym.q[ks .+ jpvt]].
     if length(ws.dense_qeff) != n
@@ -2306,11 +2230,10 @@ function _apply_QH!(F::SparseColumnPivotedQRFactorization{T}, work::Vector{T}) w
         _hh_scatter!(Vx, Vi, work, vc1, vc2, tau_b)
     end
     if ks > 0
-        # Apply dense Householders to work[ks+1 .. ks+m_active] via LAPACK.
+        # Apply dense Householders to work[ks+1 .. ks+m_active].
         # The dense block is stored in F.D (m_active x n_active), tau in F.dtau.
         # work has length m2; the dense block was built on rows ks+1..m2 of x.
-        # Apply Qᴴ of the dense tail manually: allocation-free (LAPACK ormqr!
-        # allocates an internal work buffer per call) and generic over eltype.
+        # Apply Qᴴ of the dense tail manually and allocation-free.
         # Q = H₁…H_r, H_j = I − τ_j v_j v_jᴴ, v_j in strict-lower D (v_j[j]=1).
         # Qᴴ applies H_jᴴ for j=1..r: y −= conj(τ_j)(v_jᴴ y) v_j.
         m_active = size(F.D, 1)
