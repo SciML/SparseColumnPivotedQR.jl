@@ -642,7 +642,7 @@ end
         @test norm(A1 * x - b) / norm(b) < 1.0e-10
     end
 
-    @testset "Dense-tail apply matches the LAPACK reference solve" begin
+    @testset "Dense-tail apply matches the sparse reference solve" begin
         # The manual (allocation-free) dense-tail Householder apply must give
         # the same solution as the pure-sparse path on the bundled dense-fill
         # matrices, where adaptive_dense actually triggers.
@@ -675,8 +675,8 @@ end
 
     @testset "Pooled dense tail: scpqr_refactor!(adaptive_dense) is zero-alloc" begin
         # On a dense-fill fixed pattern the adaptive-dense fallback fires; its
-        # D / top_R / jpvt / dtau / q_eff staging and the LAPACK geqp3 work
-        # buffer are pooled on the symbolic's workspace, so a steady-state
+        # D / top_R / jpvt / dtau / q_eff staging is pooled on the symbolic's
+        # workspace, so a steady-state
         # `scpqr_refactor!(adaptive_dense=true)` does no heap work (the dense-tail
         # dims are fixed once the pattern is). Verified for the four BLAS float
         # types geqp3 supports.

@@ -9,6 +9,21 @@ using SparseColumnPivotedQR
 using AMD
 
 @testset "CSC-native core" begin
+    @testset "Generic factorization interfaces" begin
+        A = sparse([2.0 0.0; 0.0 3.0; 1.0 1.0])
+        F = scpqr(A; ordering = :natural)
+        b = [2.0, 3.0, 2.0]
+        x = zeros(2)
+
+        @test size(F) == size(A)
+        @test size(F, 1) == size(A, 1)
+        @test size(F, 2) == size(A, 2)
+        @test eltype(F) === Float64
+        @test rank(F) == 2
+        @test ldiv!(x, F, b) === x
+        @test A * x ≈ b
+    end
+
     for T in (Float64, ComplexF64)
         cv(M) = T <: Complex ? (T.(M) .+ T(0.3im) .* (M .!= 0)) : T.(M)
 
