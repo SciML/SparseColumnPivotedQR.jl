@@ -6,7 +6,7 @@ makedocs(
     sitename = "SparseColumnPivotedQR.jl",
     authors = "Chris Rackauckas",
     modules = [SparseColumnPivotedQR],
-    clean = true, doctest = false, linkcheck = true,
+    clean = true, linkcheck = true,
     format = Documenter.HTML(
         canonical = "https://docs.sciml.ai/SparseColumnPivotedQR/stable/"
     ),
