@@ -1,8 +1,7 @@
 module SparseColumnPivotedQRAMDExt
 
-using SparseColumnPivotedQR
-using SparseArrays
-using AMD
+using SparseColumnPivotedQR: SparseColumnPivotedQR
+using AMD: AMD
 
 # Flag the host module so `:default` ordering resolves to `:amd` and so the
 # `:amd` opt-in doesn't error. Set on extension load, never cleared.
