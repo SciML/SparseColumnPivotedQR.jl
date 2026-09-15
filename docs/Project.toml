@@ -7,5 +7,5 @@ SparseColumnPivotedQR = "a57abbd0-fea5-4d57-96be-5e525945e8e4"
 [compat]
 AMD = "0.5"
 Documenter = "1"
-SparseArrays = "1"
+SparseArrays = "1, < 0.0.1"
 SparseColumnPivotedQR = "2"
