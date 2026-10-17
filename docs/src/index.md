@@ -5,7 +5,10 @@ SparseColumnPivotedQR.jl is a component of the
 rank-revealing, column-pivoted Householder QR factorization that operates
 directly on
 [`SparseMatrixCSC`](https://docs.julialang.org/en/v1/stdlib/SparseArrays/)
-sparse matrices.
+sparse matrices. A
+[`SparseMatrixCSR`](https://github.com/gridap/SparseMatricesCSR.jl)
+input is also accepted when `SparseMatricesCSR` is loaded, via an extension
+that converts to CSC.
 
 The package targets the same "small-to-medium sparse" niche as KLU does for
 LU — low symbolic-phase overhead, no BLAS-3 / multifrontal machinery — while
@@ -27,11 +30,15 @@ using SparseArrays, SparseColumnPivotedQR
 using AMD  # enables the recommended AMD column ordering
 
 # A 5×5 sparse matrix and a right-hand side.
-A = sparse([1.0  0   2   0   0;
-            0    3   0   0   1;
-            4    0   5   0   0;
-            0    0   0   6   0;
-            0    7   0   0   8])
+A = sparse(
+    [
+        1.0  0   2   0   0;
+        0    3   0   0   1;
+        4    0   5   0   0;
+        0    0   0   6   0;
+        0    7   0   0   8
+    ]
+)
 b = [1.0, 2.0, 3.0, 4.0, 5.0]
 
 # One-shot factor + solve.
@@ -81,7 +88,7 @@ residual to shrink the factorized form.
 
 ```julia
 F_exact = scpqr(A)                    # drop_tol = 0
-F_approx = scpqr(A; drop_tol = 1e-8)  # smaller V, larger ‖A x - b‖
+F_approx = scpqr(A; drop_tol = 1.0e-8)  # smaller V, larger ‖A x - b‖
 ```
 
 ## Rank-deficient inputs

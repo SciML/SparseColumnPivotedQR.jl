@@ -1,14 +1,19 @@
-# CSC-native core tests: the `SparseMatrixCSC` API is the native path, read
-# directly with no transpose or intermediate allocation. (Driven from
-# `runtests.jl`.)
+# CSC-native core tests: the `SparseMatrixCSC` API must work as the native
+# path with the CSR extension absent. `csr_extension_tests.jl` also includes
+# this file in a fresh subprocess that never loads `SparseMatricesCSR`; keep
+# this file free of `SparseMatricesCSR` so that check stays valid.
 using Test
 using LinearAlgebra
 using SparseArrays
 using Random
 using SparseColumnPivotedQR
-using AMD
+using AMD  # AMD extension is independent of the CSR extension
 
-@testset "CSC-native core" begin
+@assert Base.get_extension(
+    SparseColumnPivotedQR, :SparseColumnPivotedQRSparseMatricesCSRExt
+) === nothing "SparseMatricesCSR extension must NOT be loaded in the CSC-core test process"
+
+@testset "CSC-native core (no SparseMatricesCSR loaded)" begin
     @testset "Generic factorization interfaces" begin
         A = sparse([2.0 0.0; 0.0 3.0; 1.0 1.0])
         F = scpqr(A; ordering = :natural)

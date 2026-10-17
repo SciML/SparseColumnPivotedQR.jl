@@ -2,13 +2,18 @@ using SciMLTesting, SparseColumnPivotedQR, Test
 
 # ExplicitImports only sees an extension module once its trigger package is
 # loaded (`Base.get_extension` returns `nothing` otherwise), so load every
-# weakdep here to bring `SparseColumnPivotedQRAMDExt` under QA.
+# weakdep here to bring `SparseColumnPivotedQRAMDExt` and
+# `SparseColumnPivotedQRSparseMatricesCSRExt` under QA.
 using AMD
+using SparseMatricesCSR
 
 # ExplicitImports silently skips an extension that fails to load, so assert the
 # extension modules actually exist rather than trusting a green run_qa.
 @testset "Extensions loaded" begin
     @test Base.get_extension(SparseColumnPivotedQR, :SparseColumnPivotedQRAMDExt) !== nothing
+    @test Base.get_extension(
+        SparseColumnPivotedQR, :SparseColumnPivotedQRSparseMatricesCSRExt
+    ) !== nothing
 end
 
 run_qa(
